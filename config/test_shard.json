@@ -1,0 +1,114 @@
+{
+  "runner_id": "runner-test-001",
+  "shard_id": "shard-0",
+  "max_fps": 6,
+  "sources": [
+    {
+      "camera_uuid": "cam-001",
+      "url": "rtsp://127.0.0.1:8554/camera_001",
+      "site_id": "site-A",
+      "tenant_id": "tenant-01"
+    },
+    {
+      "camera_uuid": "cam-002",
+      "url": "rtsp://127.0.0.1:8554/camera_002",
+      "site_id": "site-A",
+      "tenant_id": "tenant-01"
+    },
+    {
+      "camera_uuid": "cam-003",
+      "url": "rtsp://127.0.0.1:8554/camera_003",
+      "site_id": "site-B",
+      "tenant_id": "tenant-01"
+    }
+  ],
+  "amqp": {
+    "host": "localhost",
+    "ex_status": "status.topic",
+    "ex_detect": "detections.topic"
+  },
+  "cp": {
+    "base_url": "http://localhost:8000",
+    "token": "jwt-token-here"
+  },
+  "telemetry": {
+    "report_interval_seconds": 5
+  },
+  "cameras": {
+    "cam-001": {
+      "camera_uuid": "cam-001",
+      "zones": [
+        {
+          "zone_id": 1,
+          "name": "driveway",
+          "kind": "include",
+          "priority": 100,
+          "polygon": [[100, 120], [1180, 120], [1180, 680], [100, 680]],
+          "allow_labels": ["person", "car"],
+          "deny_labels": ["cat"],
+          "min_score": 0.25
+        },
+        {
+          "zone_id": 2,
+          "name": "neighbor_lawn",
+          "kind": "exclude",
+          "priority": 200,
+          "polygon": [[1180, 120], [1800, 120], [1800, 680], [1180, 680]],
+          "deny_labels": ["person", "car"]
+        }
+      ],
+      "motion_gating": {
+        "enabled": true,
+        "downscale": 0.5,
+        "dilation_px": 6,
+        "min_area_px": 1500,
+        "cooldown_frames": 2,
+        "noise_floor": 12
+      },
+      "allow_labels": ["person", "car", "truck"],
+      "deny_labels": [],
+      "min_score": 0.30,
+      "zone_test": "center",
+      "iou_threshold": 0.10
+    },
+    "cam-002": {
+      "camera_uuid": "cam-002",
+      "zones": [
+        {
+          "zone_id": 1,
+          "name": "entrance",
+          "kind": "include",
+          "priority": 100,
+          "polygon": [[200, 200], [800, 200], [800, 600], [200, 600]],
+          "allow_labels": ["person"],
+          "min_score": 0.3
+        }
+      ],
+      "motion_gating": {
+        "enabled": true,
+        "downscale": 0.5,
+        "dilation_px": 6,
+        "min_area_px": 1200,
+        "cooldown_frames": 2,
+        "noise_floor": 10
+      },
+      "allow_labels": ["person", "car"],
+      "deny_labels": [],
+      "min_score": 0.25,
+      "zone_test": "center+iou",
+      "iou_threshold": 0.15
+    },
+    "cam-003": {
+      "camera_uuid": "cam-003",
+      "zones": [],
+      "motion_gating": {
+        "enabled": false
+      },
+      "allow_labels": null,
+      "deny_labels": [],
+      "min_score": 0.20,
+      "zone_test": "center",
+      "iou_threshold": 0.10
+    }
+  }
+}

@@ -1,0 +1,55 @@
+[project]
+name = "somba-pipeline"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aio-pika>=9.5.7",
+    "aiohttp>=3.10.11",
+    "asyncio-mqtt>=0.16.2",
+    "httpx>=0.28.1",
+    "inference>=0.52.1",
+    "numpy>=2.2.6",
+    "opencv-python>=4.10.0.84",
+    "prometheus-client>=0.22.1",
+    "pydantic>=2.11.7",
+    "python-multipart>=0.0.20",
+    "ulid-py>=1.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "aioresponses>=0.7.8",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.1.0",
+    "pytest-cov>=6.2.1",
+    "ruff>=0.12.10",
+]
+
+[project.scripts]
+production-worker = "somba_pipeline.worker:main"
+mock-control-plane = "somba_pipeline.mock_cp:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--cov=somba_pipeline",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true

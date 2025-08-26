@@ -1,0 +1,52 @@
+{
+  "runner_id": "test-runner-001",
+  "shard_id": "shard-0",
+  "max_fps": 5,
+  "sources": [
+    {
+      "camera_uuid": "test-cam-001",
+      "url": "https://media.roboflow.com/inference/people-walking.mp4",
+      "site_id": "test-site",
+      "tenant_id": "test-tenant"
+    }
+  ],
+  "amqp": {
+    "host": "localhost",
+    "ex_status": "status.topic",
+    "ex_detect": "detections.topic"
+  },
+  "cp": {
+    "base_url": "http://localhost:8000/api",
+    "token": "test-token"
+  },
+  "telemetry": {
+    "report_interval_seconds": 5
+  },
+  "cameras": {
+    "test-cam-001": {
+      "camera_uuid": "test-cam-001",
+      "zones": [
+        {
+          "zone_id": 1,
+          "name": "Zone 1",
+          "kind": "include",
+          "priority": 1,
+          "polygon": [[100, 100], [500, 100], [500, 400], [100, 400]]
+        }
+      ],
+      "motion_gating": {
+        "enabled": true,
+        "downscale": 0.5,
+        "dilation_px": 6,
+        "min_area_px": 1500,
+        "cooldown_frames": 2,
+        "noise_floor": 12
+      },
+      "allow_labels": ["person", "car"],
+      "deny_labels": [],
+      "min_score": 0.3,
+      "zone_test": "center",
+      "iou_threshold": 0.1
+    }
+  }
+}

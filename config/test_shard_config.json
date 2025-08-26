@@ -1,0 +1,95 @@
+{
+  "runner_id": "test-runner-001",
+  "shard_id": "shard-0",
+  "max_fps": 5,
+  "sources": [
+    {
+      "camera_uuid": "cam-001",
+      "url": "rtsp://localhost:8554/cam001",
+      "site_id": "site-A",
+      "tenant_id": "tenant-01"
+    },
+    {
+      "camera_uuid": "cam-002",
+      "url": "rtsp://localhost:8554/cam002",
+      "site_id": "site-A",
+      "tenant_id": "tenant-01"
+    },
+    {
+      "camera_uuid": "cam-003",
+      "url": "rtsp://localhost:8554/cam003",
+      "site_id": "site-B",
+      "tenant_id": "tenant-01"
+    }
+  ],
+  "amqp": {
+    "host": "localhost",
+    "ex_status": "status.topic",
+    "ex_detect": "detections.topic"
+  },
+  "cp": {
+    "base_url": "http://localhost:8000/api",
+    "token": "test-token"
+  },
+  "telemetry": {
+    "report_interval_seconds": 5
+  },
+  "cameras": {
+    "cam-001": {
+      "camera_uuid": "cam-001",
+      "zones": [
+        {
+          "zone_id": "zone-1",
+          "points": [[100, 100], [500, 100], [500, 400], [100, 400]]
+        }
+      ],
+      "motion_gating": {
+        "enabled": true,
+        "downscale": 0.5,
+        "dilation_px": 6,
+        "min_area_px": 1500,
+        "cooldown_frames": 2,
+        "noise_floor": 12
+      },
+      "allow_labels": ["person", "car"],
+      "deny_labels": [],
+      "min_score": 0.3,
+      "zone_test": "center",
+      "iou_threshold": 0.1
+    },
+    "cam-002": {
+      "camera_uuid": "cam-002",
+      "zones": [],
+      "motion_gating": {
+        "enabled": false
+      },
+      "allow_labels": [],
+      "deny_labels": [],
+      "min_score": 0.5,
+      "zone_test": "edge",
+      "iou_threshold": 0.2
+    },
+    "cam-003": {
+      "camera_uuid": "cam-003",
+      "zones": [
+        {
+          "zone_id": "zone-2",
+          "points": [[200, 200], [600, 200], [600, 500], [200, 500]]
+        }
+      ],
+      "motion_gating": {
+        "enabled": true,
+        "downscale": 0.3,
+        "dilation_px": 5,
+        "min_area_px": 1000,
+        "cooldown_frames": 3,
+        "noise_floor": 10
+      },
+      "allow_labels": ["person"],
+      "deny_labels": ["car"],
+      "min_score": 0.4,
+      "zone_test": "overlap",
+      "iou_threshold": 0.15
+    }
+  }
+}
