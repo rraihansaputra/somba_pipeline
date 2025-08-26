@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import asdict
+import os
 
 import aio_pika
 import cv2
@@ -43,6 +44,8 @@ from .schemas import (
     ZoneStats,
 )
 from .zone_attribution import MultiCameraZoneAttributor
+from .debug_vis import DebugManager
+from .overlays import render_debug_overlay
 
 # Configure logging
 logging.basicConfig(
@@ -103,6 +106,17 @@ class ProductionWorker:
 
         # Initialize metrics
         self._init_metrics()
+
+
+        # setup debug manager
+        self.debug_mgr = DebugManager()
+
+        # Per-camera metadata for debug
+        self._camera_meta: Dict[str, dict] = {}
+        self._motion_state: Dict[str, dict] = {}  # {cam: {"on": bool, "mask": np.ndarray, "contours": [...], "zone_hits": [...]} }
+        self._debug_rate: Dict[str, float] = {}   # {cam: last_publish_ts}
+        self._native_res: Dict[str, Tuple[int, int]] = {}  # store native resolution per camera
+        self._debug_target_fps: int = int(os.getenv("DEBUG_FPS", "8"))  # throttle; 8 fps is plenty
 
         # Event queues
         self.detection_queue = asyncio.Queue(maxsize=1000)
@@ -183,6 +197,81 @@ class ProductionWorker:
         self.draining = True
         self.running = False
 
+    def _make_contours(self, mask: Any) -> List[List[tuple[int,int]]]:
+        try:
+            m = np.asarray(mask)
+        except Exception:
+            return []
+        if m.ndim == 3:
+            m = m[..., 0]
+        if m.dtype != np.uint8:
+            m_min, m_max = float(m.min()), float(m.max())
+            if 0.0 <= m_min and m_max <= 1.0:
+                m = (m * 255.0).astype(np.uint8)
+            else:
+                m = np.clip(m, 0, 255).astype(np.uint8)
+        m = (m > 0).astype(np.uint8)
+        contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        polys: List[List[tuple[int,int]]] = []
+        for c in contours:
+            if len(c) < 3:
+                continue
+            pts = c.reshape(-1, 2)
+            polys.append([(int(x), int(y)) for x, y in pts])
+        return polys
+
+    def _should_publish_debug(self, cam: str) -> bool:
+        """Simple rate limiter while a sink exists."""
+        if not self.debug_mgr.has_sink(cam):
+            return False
+        target_dt = 1.0 / max(1, self._debug_target_fps)
+        now = time.time()
+        last = self._debug_rate.get(cam, 0.0)
+        if (now - last) >= target_dt:
+            self._debug_rate[cam] = now
+            return True
+        return False
+
+    def _publish_debug(
+        self, cam: str, frame_bgr: np.ndarray, *,
+        detections: Optional[List[dict]] = None,
+        zones: Optional[List[dict]] = None,
+        ts_ms: Optional[int] = None,
+        delta_ms: Optional[int] = None,
+        frame_id: Optional[str] = None,
+        fps: Optional[float] = None,
+        motion: Optional[dict] = None,
+    ) -> None:
+        """Unified, non-blocking call into DebugManager."""
+        # Remember native resolution for proper scaling of zones
+        self._remember_native_res(cam, frame_bgr)
+
+        # Build camera configuration dict for overlay (zones, etc.)
+        cam_cfg = {}
+        try:
+            cam_cfg_obj = self.config.cameras.get(cam)
+            if cam_cfg_obj:
+                cam_cfg = cam_cfg_obj.dict()
+        except Exception:
+            cam_cfg = {}
+
+        # Render overlay using the new Python renderer
+        annotated = render_debug_overlay(
+            frame_bgr.copy(),
+            camera_cfg=cam_cfg,
+            detections=detections or [],
+            native_resolution=self._native_res.get(cam),
+            show_fps=fps,
+            timestamp=time.time(),
+        )
+        # Publish the annotated frame via the debug manager
+        self.debug_mgr.publish_sink(cam, annotated)
+
+    def _remember_native_res(self, cam: str, frame_bgr: np.ndarray) -> None:
+        if cam not in self._native_res and frame_bgr is not None:
+            h, w = frame_bgr.shape[:2]
+            self._native_res[cam] = (w, h)
+
     async def _on_prediction_single_frame(
         self, predictions: Optional[Dict], video_frame: VideoFrame
     ):
@@ -209,10 +298,75 @@ class ProductionWorker:
                 motion_detector = self.motion_detectors[camera_uuid]
                 motion_result = motion_detector.detect_motion(video_frame.image)
 
+                # 1) Update per-camera meta (so /debug/start can derive width/height/fps)
+                h, w = video_frame.image.shape[:2]
+                fps_val = float(getattr(video_frame, "fps", 0) or 0)
+                ts_ms = int(getattr(video_frame, "ts_ms", int(time.time() * 1000)))
+
+                self._camera_meta[camera_uuid] = {"width": w, "height": h, "fps": int(fps_val or 10)}
+
+                # 2) Build motion state for overlays
+                motion_on = bool(motion_result.motion_detected)
+                raw_mask = getattr(motion_result, "mask", None)
+                mask = None if isinstance(raw_mask, (bool, np.bool_, int, float)) else raw_mask
+                raw_zone_hits = getattr(motion_result, "zone_hits", None)
+
+                def _as_zone_hits(v) -> list[str]:
+                    # mirror drawer’s logic, but lighter
+                    if v is None or v is False:
+                        return []
+                    if v is True:
+                        return ["true"]
+                    if isinstance(v, (str, bytes, bytearray)):
+                        try:
+                            return [v.decode("utf-8")] if isinstance(v, (bytes, bytearray)) else [v]
+                        except Exception:
+                            return [str(v)]
+                    if isinstance(v, dict):
+                        return [str(k) for k in v.keys()]
+                    try:
+                        from collections.abc import Iterable
+                        if isinstance(v, Iterable) and not isinstance(v, (str, bytes, bytearray)):
+                            return [str(x) for x in v]
+                    except Exception:
+                        pass
+                    return [str(v)]
+
+                zone_hits = _as_zone_hits(raw_zone_hits)
+                contours = None
+                if mask is not None:
+                    contours = self._make_contours(mask)
+
+                self._motion_state[camera_uuid] = {
+                    "on": motion_on,
+                    "mask": mask,             # keep original; draw will resize if needed
+                    "contours": contours,
+                    "zone_hits": zone_hits,
+                }
+
                 if not motion_result.motion_detected:
                     skipped_by_motion = True
                     self.frames_skipped_motion_total.labels(camera=camera_uuid).inc()
-                    # Don't publish detection event for skipped frames
+
+                    # NEW: If inference is gated OFF, still publish a debug frame at a throttled rate
+                    if self._should_publish_debug(camera_uuid):
+                        self._publish_debug(
+                            camera_uuid,
+                            video_frame.image,
+                            detections=[],                      # none (skipped inference)
+                            zones=None,
+                            ts_ms=ts_ms,
+                            delta_ms=None,
+                            frame_id=str(getattr(video_frame, "uuid", None) or getattr(video_frame, "frame_id", "")) or None,
+                            fps=fps_val if fps_val > 0 else None,
+                            motion={
+                                "on": False,
+                                "mask": mask,
+                                "contours": contours,
+                                "zone_hits": zone_hits,
+                            },
+                        )
+                    # IMPORTANT: still skip inference
                     return
 
                 logger.debug(
@@ -282,6 +436,18 @@ class ProductionWorker:
 
             # Queue for publishing
             await self.detection_queue.put(detection_event)
+
+            # Debug visual stream (non‑blocking, fire‑and‑forget)
+            self.debug_mgr.maybe_publish(
+                camera_uuid,
+                video_frame.image,
+                zones=None,
+                detections=[obj.model_dump() for obj in published_objects],
+                ts_ms=int(frame_timestamp.timestamp() * 1000),
+                delta_ms=int((datetime.now(timezone.utc) - frame_timestamp).total_seconds() * 1000),
+                frame_id=str(video_frame.frame_id),
+                fps=self._calculate_fps(camera_uuid),
+            )
 
             # Update published metrics (fix reference)
             self.detections_published.labels(camera_uuid=camera_uuid).inc()
@@ -700,10 +866,49 @@ class ProductionWorker:
     async def _run_health_server(self):
         """Run the health check HTTP server."""
         app = web.Application()
+        app["worker"] = self
+        app["get_camera_meta"] = lambda cam: self._camera_meta.get(cam, {})
         app.router.add_get("/healthz", self._health_handler)
         app.router.add_get("/ready", self._ready_handler)
         app.router.add_post("/drain", self._drain_handler)
         app.router.add_post("/terminate", self._terminate_handler)
+
+        ## debug
+        async def debug_start(request: web.Request) -> web.Response:
+            cam = request.match_info["camera_uuid"]
+            qs = request.rel_url.query
+
+            # Host/port to receive the RTP stream (often localhost + go2rtc/ffplay port)
+            host = qs.get("host", "127.0.0.1")
+            port = int(qs.get("port", "5002"))
+            ttl  = int(qs.get("ttl", "30"))
+
+            # Derive camera geometry/fps from your known state (fallbacks are safe)
+            # meta = await request.app["get_camera_meta"](cam)  # you may implement this; see below
+            meta = {}
+            width  = int(meta.get("width", 1280))
+            height = int(meta.get("height", 720))
+            fps    = int(meta.get("fps", 10))
+
+            url = request.app["worker"].debug_mgr.start(
+                cam, width=width, height=height, fps=fps, host=host, port=port, ttl_s=ttl
+            )
+            return web.json_response({
+                "camera_uuid": cam,
+                "url": url,
+                "ffplay": f"ffplay -fflags nobuffer -flags low_delay -i {url}",
+                "width": width, "height": height, "fps": fps, "ttl_s": ttl
+            })
+
+        async def debug_stop(request: web.Request) -> web.Response:
+            cam = request.match_info["camera_uuid"]
+            ok = request.app["worker"].debug_mgr.stop(cam)
+            return web.json_response({"camera_uuid": cam, "stopped": ok})
+
+        app.add_routes([
+            web.post("/debug/{camera_uuid}/start", debug_start),
+            web.post("/debug/{camera_uuid}/stop", debug_stop),
+        ])
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -729,9 +934,13 @@ class ProductionWorker:
             self._publish_status_events(),
             self._periodic_status_summary(),
             self._run_health_server(),
+            self._run_debug_server(),
         ]
 
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run_debug_server(self):
+        pass
 
     def _get_camera_uuid(self, source_id: int) -> str:
         """Map source_id to camera_uuid."""
