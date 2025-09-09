@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import asdict
 import os
+import hashlib
 
 import aio_pika
 import cv2
@@ -64,8 +65,10 @@ class ProductionWorker:
     Wraps InferencePipeline with RabbitMQ, Prometheus, motion detection, and zones.
     """
 
-    def __init__(self, config: ShardConfig):
+    def __init__(self, config: ShardConfig, config_path: Optional[str] = None):
         self.config = config
+        self.config_path = config_path
+        self.config_hash = self._calculate_config_hash() if config_path else None
         self.pipeline: Optional[InferencePipeline] = None  # InferencePipeline instance
 
         # State tracking
@@ -75,6 +78,9 @@ class ProductionWorker:
         self.camera_states: Dict[str, str] = {}  # camera_uuid -> state
         self.last_frame_times: Dict[str, datetime] = {}  # camera_uuid -> timestamp
         self.frame_counts: Dict[str, int] = {}  # camera_uuid -> frame_count
+        
+        # Config watching
+        self.config_watcher_task: Optional[asyncio.Task] = None
 
         # Get frame dimensions (would normally come from first frame)
         self.frame_width = 1920  # Default, should be updated from actual frames
@@ -139,6 +145,10 @@ class ProductionWorker:
             f"Worker initialized: runner={config.runner_id}, shard={config.shard_id}"
         )
         logger.info(f"Processing {len(config.sources)} cameras")
+        
+        # Start config watching if config path is provided
+        if self.config_path:
+            logger.info(f"Configuration hot-reload enabled for: {self.config_path}")
 
     def _init_metrics(self):
         """Initialize Prometheus metrics."""
@@ -195,6 +205,122 @@ class ProductionWorker:
         )
 
         logger.info("Prometheus metrics initialized")
+
+    def _calculate_config_hash(self) -> str:
+        """Calculate SHA256 hash of the config file."""
+        if not self.config_path:
+            return ""
+        
+        try:
+            with open(self.config_path, 'rb') as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except Exception as e:
+            logger.error(f"Error calculating config hash: {e}")
+            return ""
+
+    async def _watch_config_changes(self):
+        """Watch for configuration changes and reload when detected."""
+        if not self.config_path:
+            return
+            
+        logger.info(f"Starting configuration watcher for: {self.config_path}")
+        
+        while self.running:
+            try:
+                # Check if file exists
+                if not Path(self.config_path).exists():
+                    logger.warning(f"Config file not found: {self.config_path}")
+                    await asyncio.sleep(5)
+                    continue
+                
+                # Calculate current hash
+                current_hash = self._calculate_config_hash()
+                
+                # Compare with stored hash
+                if current_hash and current_hash != self.config_hash:
+                    logger.info(f"Configuration change detected, reloading...")
+                    await self._reload_configuration()
+                    self.config_hash = current_hash
+                
+                # Wait before next check
+                await asyncio.sleep(2)  # Check every 2 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in config watcher: {e}")
+                await asyncio.sleep(5)
+
+    async def _reload_configuration(self):
+        """Reload configuration from file."""
+        try:
+            # Load new configuration
+            new_config = ShardConfig.from_json_file(self.config_path)
+            
+            # Check for zone changes specifically
+            old_cameras = {cam_id: cam.dict() for cam_id, cam in self.config.cameras.items()}
+            new_cameras = {cam_id: cam.dict() for cam_id, cam in new_config.cameras.items()}
+            
+            zones_changed = False
+            for cam_id in old_cameras:
+                if cam_id in new_cameras:
+                    if old_cameras[cam_id].get('zones') != new_cameras[cam_id].get('zones'):
+                        zones_changed = True
+                        logger.info(f"Zone configuration changed for camera: {cam_id}")
+                        break
+            
+            # Update configuration
+            self.config = new_config
+            
+            # Reload zone attributor if zones changed
+            if zones_changed:
+                await self._reload_zones()
+            
+            logger.info("Configuration reloaded successfully")
+            
+        except Exception as e:
+            logger.error(f"Error reloading configuration: {e}")
+
+    async def _reload_zones(self):
+        """Reload zone configurations for all cameras."""
+        try:
+            logger.info("Reloading zone configurations...")
+            
+            # Get camera configurations
+            camera_configs = {
+                source["camera_uuid"]: self.config.cameras.get(
+                    source["camera_uuid"], CameraConfig(camera_uuid=source["camera_uuid"])
+                )
+                for source in self.config.sources
+            }
+            
+            # Recreate zone attributor
+            self.zone_attributor = MultiCameraZoneAttributor(
+                camera_configs, self.frame_width, self.frame_height
+            )
+            
+            # Reload motion detectors
+            from .motion_detection import MotionDetector
+            
+            self.motion_detectors.clear()
+            
+            for camera_uuid, camera_config in camera_configs.items():
+                if camera_config.motion_gating.enabled:
+                    self.motion_detectors[camera_uuid] = MotionDetector(
+                        camera_uuid=camera_uuid,
+                        motion_config=camera_config.motion_gating,
+                        zones=camera_config.zones,
+                        frame_width=self.frame_width,
+                        frame_height=self.frame_height,
+                    )
+            
+            # Update config hash metrics
+            for camera_uuid in camera_configs:
+                config_hash = self.zone_attributor.get_zones_config_hash(camera_uuid)
+                self.zones_config_hash.labels(camera=camera_uuid).set(config_hash)
+            
+            logger.info("Zone configurations reloaded successfully")
+            
+        except Exception as e:
+            logger.error(f"Error reloading zones: {e}")
 
     def _handle_shutdown(self, signum, frame):
         """Handle graceful shutdown."""
@@ -1034,6 +1160,11 @@ class ProductionWorker:
             self._run_health_server(),
             self._run_debug_server(),
         ]
+        
+        # Add config watcher if enabled
+        if self.config_path:
+            self.config_watcher_task = asyncio.create_task(self._watch_config_changes())
+            tasks.append(self.config_watcher_task)
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1449,7 +1580,7 @@ def main():
         sys.exit(1)
 
     # Start worker
-    worker = ProductionWorker(config)
+    worker = ProductionWorker(config, config_path)
     worker.start()
 
 
