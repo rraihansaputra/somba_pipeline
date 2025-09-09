@@ -78,9 +78,16 @@ class ProductionWorker:
         self.camera_states: Dict[str, str] = {}  # camera_uuid -> state
         self.last_frame_times: Dict[str, datetime] = {}  # camera_uuid -> timestamp
         self.frame_counts: Dict[str, int] = {}  # camera_uuid -> frame_count
-        
+
         # Config watching
         self.config_watcher_task: Optional[asyncio.Task] = None
+
+        # Lease awareness (Phase 4)
+        self.lease_id: Optional[str] = None
+        self.worker_id: Optional[str] = None
+        self.lease_manager = None  # Will be set by manager
+        self.config_sync = None  # Will be set by manager
+        self.lease_heartbeat_task: Optional[asyncio.Task] = None
 
         # Get frame dimensions (would normally come from first frame)
         self.frame_width = 1920  # Default, should be updated from actual frames
@@ -145,7 +152,7 @@ class ProductionWorker:
             f"Worker initialized: runner={config.runner_id}, shard={config.shard_id}"
         )
         logger.info(f"Processing {len(config.sources)} cameras")
-        
+
         # Start config watching if config path is provided
         if self.config_path:
             logger.info(f"Configuration hot-reload enabled for: {self.config_path}")
@@ -210,7 +217,7 @@ class ProductionWorker:
         """Calculate SHA256 hash of the config file."""
         if not self.config_path:
             return ""
-        
+
         try:
             with open(self.config_path, 'rb') as f:
                 return hashlib.sha256(f.read()).hexdigest()
@@ -222,9 +229,9 @@ class ProductionWorker:
         """Watch for configuration changes and reload when detected."""
         if not self.config_path:
             return
-            
+
         logger.info(f"Starting configuration watcher for: {self.config_path}")
-        
+
         while self.running:
             try:
                 # Check if file exists
@@ -232,19 +239,19 @@ class ProductionWorker:
                     logger.warning(f"Config file not found: {self.config_path}")
                     await asyncio.sleep(5)
                     continue
-                
+
                 # Calculate current hash
                 current_hash = self._calculate_config_hash()
-                
+
                 # Compare with stored hash
                 if current_hash and current_hash != self.config_hash:
                     logger.info(f"Configuration change detected, reloading...")
                     await self._reload_configuration()
                     self.config_hash = current_hash
-                
+
                 # Wait before next check
                 await asyncio.sleep(2)  # Check every 2 seconds
-                
+
             except Exception as e:
                 logger.error(f"Error in config watcher: {e}")
                 await asyncio.sleep(5)
@@ -254,11 +261,11 @@ class ProductionWorker:
         try:
             # Load new configuration
             new_config = ShardConfig.from_json_file(self.config_path)
-            
+
             # Check for zone changes specifically
             old_cameras = {cam_id: cam.dict() for cam_id, cam in self.config.cameras.items()}
             new_cameras = {cam_id: cam.dict() for cam_id, cam in new_config.cameras.items()}
-            
+
             zones_changed = False
             for cam_id in old_cameras:
                 if cam_id in new_cameras:
@@ -266,16 +273,16 @@ class ProductionWorker:
                         zones_changed = True
                         logger.info(f"Zone configuration changed for camera: {cam_id}")
                         break
-            
+
             # Update configuration
             self.config = new_config
-            
+
             # Reload zone attributor if zones changed
             if zones_changed:
                 await self._reload_zones()
-            
+
             logger.info("Configuration reloaded successfully")
-            
+
         except Exception as e:
             logger.error(f"Error reloading configuration: {e}")
 
@@ -283,7 +290,7 @@ class ProductionWorker:
         """Reload zone configurations for all cameras."""
         try:
             logger.info("Reloading zone configurations...")
-            
+
             # Get camera configurations
             camera_configs = {
                 source["camera_uuid"]: self.config.cameras.get(
@@ -291,17 +298,17 @@ class ProductionWorker:
                 )
                 for source in self.config.sources
             }
-            
+
             # Recreate zone attributor
             self.zone_attributor = MultiCameraZoneAttributor(
                 camera_configs, self.frame_width, self.frame_height
             )
-            
+
             # Reload motion detectors
             from .motion_detection import MotionDetector
-            
+
             self.motion_detectors.clear()
-            
+
             for camera_uuid, camera_config in camera_configs.items():
                 if camera_config.motion_gating.enabled:
                     self.motion_detectors[camera_uuid] = MotionDetector(
@@ -311,14 +318,14 @@ class ProductionWorker:
                         frame_width=self.frame_width,
                         frame_height=self.frame_height,
                     )
-            
+
             # Update config hash metrics
             for camera_uuid in camera_configs:
                 config_hash = self.zone_attributor.get_zones_config_hash(camera_uuid)
                 self.zones_config_hash.labels(camera=camera_uuid).set(config_hash)
-            
+
             logger.info("Zone configurations reloaded successfully")
-            
+
         except Exception as e:
             logger.error(f"Error reloading zones: {e}")
 
@@ -327,6 +334,130 @@ class ProductionWorker:
         logger.info(f"Received signal {signum}, initiating graceful shutdown...")
         self.draining = True
         self.running = False
+
+    # Lease-aware methods (Phase 4)
+    def set_lease_info(self, lease_id: str, worker_id: str):
+        """Set lease information for this worker."""
+        self.lease_id = lease_id
+        self.worker_id = worker_id
+        logger.info(f"Worker {worker_id} set lease ID: {lease_id}")
+
+    async def start_lease_heartbeat(self):
+        """Start lease heartbeat task."""
+        if not self.lease_id or not self.lease_manager:
+            return
+
+        self.lease_heartbeat_task = asyncio.create_task(self._lease_heartbeat_loop())
+        logger.info(f"Started lease heartbeat for worker {self.worker_id}")
+
+    async def stop_lease_heartbeat(self):
+        """Stop lease heartbeat task."""
+        if self.lease_heartbeat_task:
+            self.lease_heartbeat_task.cancel()
+            try:
+                await self.lease_heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self.lease_heartbeat_task = None
+            logger.info(f"Stopped lease heartbeat for worker {self.worker_id}")
+
+    async def _lease_heartbeat_loop(self):
+        """Background task to send lease heartbeats."""
+        while self.running and self.lease_id:
+            try:
+                # Collect processing stats
+                stats = {
+                    "processed_frames": sum(self.frame_counts.values()),
+                    "active_cameras": len(self.camera_states),
+                    "camera_states": self.camera_states.copy(),
+                    "last_frame_times": {
+                        cam: ts.isoformat() for cam, ts in self.last_frame_times.items()
+                    },
+                }
+
+                # Send heartbeat
+                success = await self.lease_manager.send_heartbeat(
+                    self.lease_id,
+                    stats,
+                    CameraStatus.ONLINE if self.ready else CameraStatus.OFFLINE,
+                )
+
+                if success:
+                    logger.debug(f"Lease heartbeat sent for {self.lease_id}")
+                else:
+                    logger.warning(
+                        f"Failed to send lease heartbeat for {self.lease_id}"
+                    )
+
+                await asyncio.sleep(15)  # Heartbeat every 15 seconds
+
+            except asyncio.CancelledError:
+                logger.debug("Lease heartbeat loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in lease heartbeat loop: {e}")
+                await asyncio.sleep(10)
+
+    async def handle_configuration_update(self, new_config: CameraConfig):
+        """Handle configuration updates from manager."""
+        if not new_config:
+            return
+
+        camera_uuid = new_config.camera_uuid
+        logger.info(f"Updating configuration for camera {camera_uuid}")
+
+        try:
+            # Update zone attribution
+            self.zone_attributor.update_camera_config(camera_uuid, new_config)
+
+            # Update motion detection
+            if camera_uuid in self.motion_detectors:
+                self.motion_detectors[camera_uuid].update_zones(new_config.zones)
+
+            # Update metrics
+            config_hash = self.zone_attributor.get_zones_config_hash(camera_uuid)
+            self.zones_config_hash.labels(camera=camera_uuid).set(config_hash)
+
+            logger.info(f"Configuration updated successfully for camera {camera_uuid}")
+
+        except Exception as e:
+            logger.error(f"Error updating configuration for camera {camera_uuid}: {e}")
+
+    def get_worker_stats(self) -> Dict[str, Any]:
+        """Get worker statistics for reporting."""
+        return {
+            "worker_id": self.worker_id,
+            "lease_id": self.lease_id,
+            "running": self.running,
+            "ready": self.ready,
+            "draining": self.draining,
+            "camera_count": len(self.camera_states),
+            "processed_frames": sum(self.frame_counts.values()),
+            "camera_states": self.camera_states.copy(),
+            "last_activity": max(
+                (ts.isoformat() for ts in self.last_frame_times.values()),
+                default="never",
+            )
+            if self.last_frame_times
+            else "never",
+        }
+
+    async def handle_lease_loss(self):
+        """Handle loss of lease."""
+        logger.warning(f"Worker {self.worker_id} lost lease {self.lease_id}")
+
+        # Stop processing
+        self.draining = True
+        self.running = False
+
+        # Stop lease heartbeat
+        await self.stop_lease_heartbeat()
+
+        # Shutdown pipeline
+        if self.pipeline:
+            await self._shutdown_pipeline()
+
+        logger.info(f"Worker {self.worker_id} shut down due to lease loss")
 
     def _make_contours(self, mask: Any) -> List[List[tuple[int,int]]]:
         try:
@@ -368,24 +499,24 @@ class ProductionWorker:
         dets = []
         if not predictions:
             return dets
-            
+
         # Handle supervision Detections object
         if hasattr(predictions, "xyxy") and hasattr(predictions, "confidence"):
             if predictions.xyxy is not None and len(predictions.xyxy) > 0:
                 for i in range(len(predictions.xyxy)):
                     x1, y1, x2, y2 = predictions.xyxy[i]
                     bbox = [float(x1), float(y1), float(x2), float(y2)]
-                    
+
                     label = "unknown"
                     if predictions.data and "class_name" in predictions.data:
                         label = str(predictions.data["class_name"][i])
-                        
+
                     score = float(predictions.confidence[i]) if predictions.confidence is not None else 0.0
-                    
+
                     track_id = None
                     if predictions.data and "tracker_id" in predictions.data:
                         track_id = int(predictions.data["tracker_id"][i])
-                    
+
                     dets.append({
                         "bbox": bbox,
                         "label": label,
@@ -397,7 +528,7 @@ class ProductionWorker:
             for p in predictions:
                 if not isinstance(p, dict):
                     continue
-                    
+
                 # Try different bbox formats
                 bbox = p.get("bbox") or p.get("xyxy")
                 if bbox is None and all(k in p for k in ("x1","y1","x2","y2")):
@@ -456,7 +587,7 @@ class ProductionWorker:
         # Build detections list
         height, width = frame_bgr.shape[:2]
         dets = self._build_debug_detections(predictions, width, height)
-        
+
         # Update last detections if we ran inference
         if not skipped_by_motion and dets:
             self._last_detections[cam] = dets
@@ -526,8 +657,8 @@ class ProductionWorker:
                     cam_cfg = {}
 
                 self._camera_meta[camera_uuid] = {
-                    "width": w, 
-                    "height": h, 
+                    "width": w,
+                    "height": h,
                     "fps": int(fps_val or 10),
                     "zones": cam_cfg.get("zones", [])
                 }
@@ -1160,7 +1291,7 @@ class ProductionWorker:
             self._run_health_server(),
             self._run_debug_server(),
         ]
-        
+
         # Add config watcher if enabled
         if self.config_path:
             self.config_watcher_task = asyncio.create_task(self._watch_config_changes())

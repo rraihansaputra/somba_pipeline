@@ -48,10 +48,18 @@ class MotionGatingConfig(BaseModel):
     )
 
     # Advanced settings
-    roi_native: bool = Field(True, description="Compute motion entirely inside include zones")
-    adaptive_threshold_factor: float = Field(0.7, description="Adaptive threshold factor for ROI-native mode")
-    min_area_mode: Literal["px", "roi_percent"] = Field("px", description="Minimum area mode")
-    min_area_roi_percent: float = Field(0.5, description="Minimum area as percentage of ROI")
+    roi_native: bool = Field(
+        True, description="Compute motion entirely inside include zones"
+    )
+    adaptive_threshold_factor: float = Field(
+        0.7, description="Adaptive threshold factor for ROI-native mode"
+    )
+    min_area_mode: Literal["px", "roi_percent"] = Field(
+        "px", description="Minimum area mode"
+    )
+    min_area_roi_percent: float = Field(
+        0.5, description="Minimum area as percentage of ROI"
+    )
 
 
 class CameraConfig(BaseModel):
@@ -222,6 +230,43 @@ class ShardConfig(BaseModel):
     @classmethod
     def from_json_file(cls, file_path: str) -> "ShardConfig":
         """Load shard config from JSON file."""
+        with open(file_path, "r") as f:
+            data = json.load(f)
+        return cls(**data)
+
+
+class ManagerConfig(BaseModel):
+    """Manager process configuration."""
+
+    # Identification
+    runner_id: str = Field(..., description="Unique runner identifier")
+    shard_id: str = Field(..., description="Shard identifier")
+
+    # Control plane
+    control_plane_url: str = Field(..., description="Control plane API URL")
+    api_key: str = Field(..., description="API key for control plane")
+    control_plane: Dict[str, str] = Field(
+        ..., description="Control plane configuration"
+    )
+
+    # Worker management
+    max_workers: int = Field(4, description="Maximum worker processes")
+    max_cameras_per_worker: int = Field(16, description="Maximum cameras per worker")
+
+    # Lease configuration
+    lease_ttl_seconds: int = Field(60, description="Lease TTL in seconds")
+    heartbeat_interval_seconds: int = Field(30, description="Heartbeat interval")
+
+    # Worker configuration
+    worker_config_path: str = Field(..., description="Path to worker config template")
+
+    # Monitoring
+    health_check_interval: int = Field(30, description="Health check interval")
+    metrics_port: int = Field(9109, description="Manager metrics port")
+
+    @classmethod
+    def from_json_file(cls, file_path: str) -> "ManagerConfig":
+        """Load manager config from JSON file."""
         with open(file_path, "r") as f:
             data = json.load(f)
         return cls(**data)

@@ -1,0 +1,20 @@
+{
+  "runner_id": "runner-test-001",
+  "shard_id": "shard-0",
+  "control_plane_url": "http://localhost:8000",
+  "api_key": "test-api-key-here",
+  "control_plane": {
+    "base_url": "http://localhost:8000",
+    "token": "jwt-token-here",
+    "lease_ttl_seconds": 60,
+    "renewal_interval_seconds": 30,
+    "heartbeat_interval_seconds": 15
+  },
+  "max_workers": 4,
+  "max_cameras_per_worker": 16,
+  "lease_ttl_seconds": 60,
+  "heartbeat_interval_seconds": 30,
+  "worker_config_path": "/tmp/worker_config_template.json",
+  "health_check_interval": 30,
+  "metrics_port": 9109
+}
