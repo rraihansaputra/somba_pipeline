@@ -29,20 +29,6 @@ class ZoneConfig(BaseModel):
 
 
 class MotionGatingConfig(BaseModel):
-    enabled: bool = True
-    # New: compute motion entirely inside include zones (minus excludes)
-    roi_native: bool = True
-    # Existing knobs (examples; keep yours)
-    downscale: int = 2
-    dilation_px: int = 6
-    min_area_px: int = 1500
-    cooldown_frames: int = 2
-    noise_floor: int = 12
-    # Optional: adaptive threshold factor for ROI-native mode
-    adaptive_threshold_factor: float = 0.7
-    # Optional: let min_area be proportional to ROI area
-    min_area_mode: Literal["px", "roi_percent"] = "px"
-    min_area_roi_percent: float = 0.5
     """Motion gating configuration."""
 
     enabled: bool = Field(True, description="Enable motion gating")
@@ -55,6 +41,17 @@ class MotionGatingConfig(BaseModel):
     )
     cooldown_frames: int = Field(2, ge=0, description="Cooldown frames for hysteresis")
     noise_floor: int = Field(12, ge=0, description="Ignore tiny contours")
+
+    # New: maximum time between inference (even when no motion)
+    max_inference_interval_seconds: float = Field(
+        10, ge=0, description="Maximum seconds between inference (0 = no max interval)"
+    )
+
+    # Advanced settings
+    roi_native: bool = Field(True, description="Compute motion entirely inside include zones")
+    adaptive_threshold_factor: float = Field(0.7, description="Adaptive threshold factor for ROI-native mode")
+    min_area_mode: Literal["px", "roi_percent"] = Field("px", description="Minimum area mode")
+    min_area_roi_percent: float = Field(0.5, description="Minimum area as percentage of ROI")
 
 
 class CameraConfig(BaseModel):

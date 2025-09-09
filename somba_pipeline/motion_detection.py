@@ -87,6 +87,7 @@ class MotionDetector:
         # Motion state
         self.previous_gray: Optional[np.ndarray] = None
         self.last_motion_time: Optional[datetime] = None
+        self.last_inference_time: Optional[datetime] = None
         self.cooldown_counter = 0
 
         # Build zone masks
@@ -99,6 +100,7 @@ class MotionDetector:
             "frames_with_motion": 0,
             "frames_skipped_cooldown": 0,
             "frames_skipped_no_motion": 0,
+            "frames_skipped_interval": 0,
         }
 
         logger.info(f"Motion detector initialized for {camera_uuid}")
@@ -240,6 +242,46 @@ class MotionDetector:
             else:
                 self.stats["frames_skipped_no_motion"] += 1
 
+        # Check maximum inference interval
+        current_time = datetime.now()
+        if (
+            self.config.max_inference_interval_seconds > 0
+            and self.last_inference_time is not None
+            and (current_time - self.last_inference_time).total_seconds() >= self.config.max_inference_interval_seconds
+        ):
+            # Force inference due to maximum interval
+            significant_motion = True
+            self.stats["frames_skipped_interval"] = self.stats.get("frames_skipped_interval", 0) + 1
+            
+            logger.debug(
+                f"Force inference {self.camera_uuid}: "
+                f"{(current_time - self.last_inference_time).total_seconds():.1f}s since last inference"
+            )
+
+        # Update last inference time if we're running inference
+        if significant_motion:
+            self.last_inference_time = current_time
+
+        # Check maximum inference interval
+        current_time = datetime.now()
+        if (
+            self.config.max_inference_interval_seconds > 0
+            and self.last_inference_time is not None
+            and (current_time - self.last_inference_time).total_seconds() >= self.config.max_inference_interval_seconds
+        ):
+            # Force inference due to maximum interval
+            significant_motion = True
+            self.stats["frames_skipped_interval"] = self.stats.get("frames_skipped_interval", 0) + 1
+            
+            logger.debug(
+                f"Force inference {self.camera_uuid}: "
+                f"{(current_time - self.last_inference_time).total_seconds():.1f}s since last inference"
+            )
+
+        # Update last inference time if we're running inference
+        if significant_motion:
+            self.last_inference_time = current_time
+
         # Update state AFTER computation
         self.previous_gray = gray.copy()
 
@@ -334,6 +376,26 @@ class MotionDetector:
             else:
                 self.stats["frames_skipped_no_motion"] += 1
 
+        # Check maximum inference interval
+        current_time = datetime.now()
+        if (
+            self.config.max_inference_interval_seconds > 0
+            and self.last_inference_time is not None
+            and (current_time - self.last_inference_time).total_seconds() >= self.config.max_inference_interval_seconds
+        ):
+            # Force inference due to maximum interval
+            significant_motion = True
+            self.stats["frames_skipped_interval"] = self.stats.get("frames_skipped_interval", 0) + 1
+            
+            logger.debug(
+                f"Force inference {self.camera_uuid}: "
+                f"{(current_time - self.last_inference_time).total_seconds():.1f}s since last inference"
+            )
+
+        # Update last inference time if we're running inference
+        if significant_motion:
+            self.last_inference_time = current_time
+
         return MotionResult(
             motion_detected=significant_motion,
             pixels_changed=motion_area,
@@ -369,6 +431,9 @@ class MotionDetector:
                 (stats["frames_skipped_cooldown"] + stats["frames_skipped_no_motion"])
                 / stats["frames_processed"]
                 * 100
+            )
+            stats["interval_skip_rate_pct"] = (
+                stats["frames_skipped_interval"] / stats["frames_processed"] * 100
             )
         return stats
 
