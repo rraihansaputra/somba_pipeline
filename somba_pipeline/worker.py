@@ -46,6 +46,8 @@ from .schemas import (
 from .zone_attribution import MultiCameraZoneAttributor
 from .debug_vis import DebugManager
 from .overlays import render_debug_overlay
+from .scaling import resolve_proc_size
+from .zones import ZoneMaskBuilder
 
 # Configure logging
 logging.basicConfig(
@@ -114,8 +116,11 @@ class ProductionWorker:
         # Per-camera metadata for debug
         self._camera_meta: Dict[str, dict] = {}
         self._motion_state: Dict[str, dict] = {}  # {cam: {"on": bool, "mask": np.ndarray, "contours": [...], "zone_hits": [...]} }
+        self._motion_debug: Dict[str, dict] = {}  # {cam: {"mask": np.ndarray, "contours": [...], "active": bool, "cooldown": int, "gate_reason": str, "min_area_px": int}}
         self._debug_rate: Dict[str, float] = {}   # {cam: last_publish_ts}
         self._native_res: Dict[str, Tuple[int, int]] = {}  # store native resolution per camera
+        self._last_infer_state: Dict[str, str] = {}  # {cam: "INFER"|"SKIP"|"COOLDOWN"}
+        self._last_detections: Dict[str, List[dict]] = {}  # {cam: [last detections]}
         self._debug_target_fps: int = int(os.getenv("DEBUG_FPS", "8"))  # throttle; 8 fps is plenty
 
         # Event queues
@@ -232,21 +237,88 @@ class ProductionWorker:
             return True
         return False
 
+    def _build_debug_detections(self, predictions: Optional[Dict], frame_width: int, frame_height: int) -> List[dict]:
+        """Convert raw predictions to standardized detection format for debug overlay."""
+        dets = []
+        if not predictions:
+            return dets
+            
+        # Handle supervision Detections object
+        if hasattr(predictions, "xyxy") and hasattr(predictions, "confidence"):
+            if predictions.xyxy is not None and len(predictions.xyxy) > 0:
+                for i in range(len(predictions.xyxy)):
+                    x1, y1, x2, y2 = predictions.xyxy[i]
+                    bbox = [float(x1), float(y1), float(x2), float(y2)]
+                    
+                    label = "unknown"
+                    if predictions.data and "class_name" in predictions.data:
+                        label = str(predictions.data["class_name"][i])
+                        
+                    score = float(predictions.confidence[i]) if predictions.confidence is not None else 0.0
+                    
+                    track_id = None
+                    if predictions.data and "tracker_id" in predictions.data:
+                        track_id = int(predictions.data["tracker_id"][i])
+                    
+                    dets.append({
+                        "bbox": bbox,
+                        "label": label,
+                        "score": score,
+                        "track_id": track_id
+                    })
+        elif isinstance(predictions, list):
+            # Handle list of dictionaries
+            for p in predictions:
+                if not isinstance(p, dict):
+                    continue
+                    
+                # Try different bbox formats
+                bbox = p.get("bbox") or p.get("xyxy")
+                if bbox is None and all(k in p for k in ("x1","y1","x2","y2")):
+                    bbox = [p["x1"], p["y1"], p["x2"], p["y2"]]
+                if bbox is None and all(k in p for k in ("x","y","width","height")):
+                    x, y, w, h = float(p["x"]), float(p["y"]), float(p["width"]), float(p["height"])
+                    bbox = [x - w/2, y - h/2, x + w/2, y + h/2]
+                if bbox is None and all(k in p for k in ("cx","cy","w","h")):
+                    cx, cy, w, h = float(p["cx"]), float(p["cy"]), float(p["w"]), float(p["h"])
+                    if max(cx, cy, w, h) <= 1.5:  # normalized coords
+                        cx, cy, w, h = cx*frame_width, cy*frame_height, w*frame_width, h*frame_height
+                    bbox = [cx - w/2, cy - h/2, cx + w/2, cy + h/2]
+
+                if not bbox:
+                    continue
+
+                # Convert to pixel coordinates and clip
+                x1, y1, x2, y2 = map(int, bbox)
+                x1 = max(0, min(frame_width-1, x1))
+                x2 = max(0, min(frame_width-1, x2))
+                y1 = max(0, min(frame_height-1, y1))
+                y2 = max(0, min(frame_height-1, y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                dets.append({
+                    "bbox": [x1, y1, x2, y2],
+                    "label": p.get("label") or p.get("class") or "obj",
+                    "score": float(p.get("score") or p.get("confidence") or 0.0),
+                    "track_id": p.get("track_id")
+                })
+        return dets
+
     def _publish_debug(
         self, cam: str, frame_bgr: np.ndarray, *,
-        detections: Optional[List[dict]] = None,
-        zones: Optional[List[dict]] = None,
-        ts_ms: Optional[int] = None,
-        delta_ms: Optional[int] = None,
-        frame_id: Optional[str] = None,
+        predictions: Optional[Dict] = None,
+        skipped_by_motion: bool = False,
         fps: Optional[float] = None,
-        motion: Optional[dict] = None,
     ) -> None:
-        """Unified, non-blocking call into DebugManager."""
+        """Unified, non-blocking call into DebugManager with full debug context."""
+        if not self._should_publish_debug(cam):
+            return
+
         # Remember native resolution for proper scaling of zones
         self._remember_native_res(cam, frame_bgr)
 
-        # Build camera configuration dict for overlay (zones, etc.)
+        # Build camera configuration dict for overlay
         cam_cfg = {}
         try:
             cam_cfg_obj = self.config.cameras.get(cam)
@@ -255,14 +327,29 @@ class ProductionWorker:
         except Exception:
             cam_cfg = {}
 
+        # Build detections list
+        height, width = frame_bgr.shape[:2]
+        dets = self._build_debug_detections(predictions, width, height)
+        
+        # Update last detections if we ran inference
+        if not skipped_by_motion and dets:
+            self._last_detections[cam] = dets
+
+        # Use last detections for ghosting on skipped frames
+        dets_for_render = dets
+        if skipped_by_motion and not dets:
+            dets_for_render = self._last_detections.get(cam, [])
+
         # Render overlay using the new Python renderer
         annotated = render_debug_overlay(
             frame_bgr.copy(),
             camera_cfg=cam_cfg,
-            detections=detections or [],
+            detections=dets_for_render,
             native_resolution=self._native_res.get(cam),
             show_fps=fps,
             timestamp=time.time(),
+            motion_debug=self._motion_debug.get(cam),
+            inference_state=self._last_infer_state.get(cam),
         )
         # Publish the annotated frame via the debug manager
         self.debug_mgr.publish_sink(cam, annotated)
@@ -303,7 +390,21 @@ class ProductionWorker:
                 fps_val = float(getattr(video_frame, "fps", 0) or 0)
                 ts_ms = int(getattr(video_frame, "ts_ms", int(time.time() * 1000)))
 
-                self._camera_meta[camera_uuid] = {"width": w, "height": h, "fps": int(fps_val or 10)}
+                # Build camera configuration dict for overlay (include zones)
+                cam_cfg = {}
+                try:
+                    cam_cfg_obj = self.config.cameras.get(camera_uuid)
+                    if cam_cfg_obj:
+                        cam_cfg = cam_cfg_obj.dict()
+                except Exception:
+                    cam_cfg = {}
+
+                self._camera_meta[camera_uuid] = {
+                    "width": w, 
+                    "height": h, 
+                    "fps": int(fps_val or 10),
+                    "zones": cam_cfg.get("zones", [])
+                }
 
                 # 2) Build motion state for overlays
                 motion_on = bool(motion_result.motion_detected)
@@ -343,29 +444,28 @@ class ProductionWorker:
                     "contours": contours,
                     "zone_hits": zone_hits,
                 }
+                self._motion_debug[camera_uuid] = {
+                    "mask": mask,
+                    "contours": contours,
+                    "active": motion_on,
+                    "cooldown": int(getattr(motion_result, "cooldown_frames_left", 0)),
+                    "gate_reason": str(getattr(motion_result, "gate_reason", "")),
+                    "min_area_px": int(getattr(motion_result, "min_area_px", 0)),
+                }
 
                 if not motion_result.motion_detected:
                     skipped_by_motion = True
                     self.frames_skipped_motion_total.labels(camera=camera_uuid).inc()
+                    self._last_infer_state[camera_uuid] = "SKIP"
 
-                    # NEW: If inference is gated OFF, still publish a debug frame at a throttled rate
-                    if self._should_publish_debug(camera_uuid):
-                        self._publish_debug(
-                            camera_uuid,
-                            video_frame.image,
-                            detections=[],                      # none (skipped inference)
-                            zones=None,
-                            ts_ms=ts_ms,
-                            delta_ms=None,
-                            frame_id=str(getattr(video_frame, "uuid", None) or getattr(video_frame, "frame_id", "")) or None,
-                            fps=fps_val if fps_val > 0 else None,
-                            motion={
-                                "on": False,
-                                "mask": mask,
-                                "contours": contours,
-                                "zone_hits": zone_hits,
-                            },
-                        )
+                    # Render and publish debug frame (throttled) - always show zones even when no motion
+                    self._publish_debug(
+                        cam=camera_uuid,
+                        frame_bgr=video_frame.image,
+                        predictions=None,
+                        skipped_by_motion=True,
+                        fps=self._calculate_fps(camera_uuid),
+                    )
                     # IMPORTANT: still skip inference
                     return
 
@@ -437,15 +537,13 @@ class ProductionWorker:
             # Queue for publishing
             await self.detection_queue.put(detection_event)
 
-            # Debug visual stream (non‑blocking, fire‑and‑forget)
-            self.debug_mgr.maybe_publish(
-                camera_uuid,
-                video_frame.image,
-                zones=None,
-                detections=[obj.model_dump() for obj in published_objects],
-                ts_ms=int(frame_timestamp.timestamp() * 1000),
-                delta_ms=int((datetime.now(timezone.utc) - frame_timestamp).total_seconds() * 1000),
-                frame_id=str(video_frame.frame_id),
+            # Debug visual stream (non-blocking, fire-and-forget)
+            self._last_infer_state[camera_uuid] = "INFER"
+            self._publish_debug(
+                cam=camera_uuid,
+                frame_bgr=video_frame.image,
+                predictions=raw_detections,
+                skipped_by_motion=False,
                 fps=self._calculate_fps(camera_uuid),
             )
 

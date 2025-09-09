@@ -61,7 +61,7 @@
         "enabled": true,
         "downscale": 0.5,
         "dilation_px": 6,
-        "min_area_px": 1500,
+        "min_area_px": 150,
         "cooldown_frames": 2,
         "noise_floor": 12
       },
@@ -88,7 +88,7 @@
         "enabled": true,
         "downscale": 0.5,
         "dilation_px": 6,
-        "min_area_px": 1200,
+        "min_area_px": 150,
         "cooldown_frames": 2,
         "noise_floor": 10
       },

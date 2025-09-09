@@ -3,7 +3,7 @@ Event schemas v2 for detections and status events with zone support.
 """
 
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Literal
 from pydantic import BaseModel, Field
 import hashlib
 import json
@@ -29,6 +29,20 @@ class ZoneConfig(BaseModel):
 
 
 class MotionGatingConfig(BaseModel):
+    enabled: bool = True
+    # New: compute motion entirely inside include zones (minus excludes)
+    roi_native: bool = True
+    # Existing knobs (examples; keep yours)
+    downscale: int = 2
+    dilation_px: int = 6
+    min_area_px: int = 1500
+    cooldown_frames: int = 2
+    noise_floor: int = 12
+    # Optional: adaptive threshold factor for ROI-native mode
+    adaptive_threshold_factor: float = 0.7
+    # Optional: let min_area be proportional to ROI area
+    min_area_mode: Literal["px", "roi_percent"] = "px"
+    min_area_roi_percent: float = 0.5
     """Motion gating configuration."""
 
     enabled: bool = Field(True, description="Enable motion gating")

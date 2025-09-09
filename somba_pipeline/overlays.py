@@ -46,6 +46,8 @@ def render_debug_overlay(
     native_resolution: Optional[Tuple[int, int]] = None,
     show_fps: Optional[float] = None,
     timestamp: Optional[float] = None,
+    motion_debug: Optional[Dict] = None,
+    inference_state: Optional[str] = None,
 ) -> np.ndarray:
     """Draw zones and detections on a BGR frame and return the annotated image."""
     img = frame_bgr
@@ -85,6 +87,41 @@ def render_debug_overlay(
         _draw_label_box(img, label, (int(anchor[0]) + 4, int(anchor[1]) + 20))
 
     cv2.addWeighted(overlay, 0.35, img, 0.65, 0, img)
+    
+    # Draw ROI-native motion mask if available
+    if motion_debug and motion_debug.get("mask") is not None:
+        mask = motion_debug["mask"]
+        if mask.shape[:2] != (h, w):
+            # Upsample the mask using nearest neighbor interpolation to avoid blur
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        
+        # Create a semi-transparent overlay for motion
+        motion_overlay = img.copy()
+        # Use a yellow tint for motion
+        motion_overlay[mask > 0] = [100, 200, 255]  # BGR for yellow
+        cv2.addWeighted(motion_overlay, 0.3, img, 0.7, 0, img)
+        
+        # Draw motion contours
+        contours = motion_debug.get("contours", [])
+        if contours:
+            for contour in contours:
+                if len(contour) >= 3:
+                    contour_array = np.array(contour, dtype=np.int32)
+                    cv2.polylines(img, [contour_array], isClosed=True, color=BGR_YELLOW, thickness=2, lineType=cv2.LINE_AA)
+        
+        # Additional debug info from ROI-native motion detection
+        debug_info = motion_debug.get("debug", {})
+        if debug_info:
+            roi_area = debug_info.get("roi_area", 0)
+            min_area = debug_info.get("min_area_px_resolved", 0)
+            mean_diff = debug_info.get("mean_diff_masked", 0)
+            threshold = debug_info.get("dynamic_thresh", 0)
+            
+            debug_text = f"ROI: {roi_area}px | Min: {min_area}px"
+            _draw_label_box(img, debug_text, (10, 55))
+            
+            debug_text = f"Mean: {mean_diff:.1f} | Thr: {threshold:.1f}"
+            _draw_label_box(img, debug_text, (10, 80))
 
     # Draw detections
     if detections:
@@ -103,6 +140,34 @@ def render_debug_overlay(
             if tid is not None:
                 txt = f"id={tid} " + txt
             _draw_label_box(img, txt, (x1, max(0, y1 - 6)))
+
+    # Motion debug chip (if provided)
+    if motion_debug:
+        active = bool(motion_debug.get("active", False))
+        gate_reason = motion_debug.get("gate_reason", "")
+        status_txt = "ON" if active else "OFF"
+        chip_txt = f"MOTION: {status_txt}"
+        if gate_reason:
+            chip_txt += f" ({gate_reason})"
+        _draw_label_box(img, chip_txt, (10, 30))
+        
+        # Additional debug info from ROI-native motion detection
+        debug_info = motion_debug.get("debug", {})
+        if debug_info:
+            roi_area = debug_info.get("roi_area", 0)
+            min_area = debug_info.get("min_area_px_resolved", 0)
+            mean_diff = debug_info.get("mean_diff_masked", 0)
+            threshold = debug_info.get("dynamic_thresh", 0)
+            
+            debug_text = f"ROI: {roi_area}px | Min: {min_area}px"
+            _draw_label_box(img, debug_text, (10, 55))
+            
+            debug_text = f"Mean: {mean_diff:.1f} | Thr: {threshold:.1f}"
+            _draw_label_box(img, debug_text, (10, 80))
+
+    # Inference state chip (if provided)
+    if inference_state:
+        _draw_label_box(img, inference_state, (10, 105))
 
     # HUD with timestamp / FPS
     if timestamp is not None or show_fps is not None:

@@ -23,6 +23,7 @@ class MotionResult:
     contour_count: int
     include_mask_area: int
     motion_in_include_area: int
+    debug: dict  # extra values for overlay/telemetry
 
 
 class ZoneMaskBuilder:
@@ -135,6 +136,131 @@ class MotionDetector:
         # Convert to grayscale
         gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
 
+        # Safety: ensure mask is binary uint8 0/255 and matches size
+        roi_mask = include_mask_small
+        if roi_mask.dtype != np.uint8:
+            roi_mask = roi_mask.astype(np.uint8)
+        if roi_mask.max() == 1:
+            roi_mask = roi_mask * 255
+
+        if not self.config.roi_native:
+            # ---------------------------
+            # Legacy (post-hoc) behavior:
+            # ---------------------------
+            return self._detect_motion_legacy(gray, roi_mask)
+
+        # ---------------------------
+        # ROI-native implementation:
+        # ---------------------------
+
+        # Mask the frames BEFORE differencing & stats
+        gray_masked = cv2.bitwise_and(gray, gray, mask=roi_mask)
+
+        if self.previous_gray is not None:
+            prev_masked = cv2.bitwise_and(self.previous_gray, self.previous_gray, mask=roi_mask)
+            frame_diff = cv2.absdiff(prev_masked, gray_masked)
+        else:
+            # First frame: no diff
+            frame_diff = np.zeros_like(gray)
+
+        # Adaptive threshold using ONLY ROI pixels
+        # Note: cv2.mean takes an optional mask to limit pixels considered
+        mean_val = cv2.mean(frame_diff, mask=roi_mask)[0]
+        dynamic_thresh = max(5.0, mean_val * 2.0)  # Dynamic threshold
+        _, thresh = cv2.threshold(frame_diff, dynamic_thresh, 255, cv2.THRESH_BINARY)
+
+        # Background subtraction INSIDE the ROI
+        # Applying bg_subtractor to masked gray keeps model focused on ROI
+        fg_mask = self.bg_subtractor.apply(gray_masked)
+        fg_mask = cv2.bitwise_and(fg_mask, roi_mask)
+
+        # Combine diff and FG; then morphology INSIDE ROI
+        motion_mask = cv2.bitwise_or(fg_mask, thresh)
+
+        # Morphological operations to clean up noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
+        motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, kernel)
+
+        # Dilate motion mask by dilation_px
+        if self.config.dilation_px > 0:
+            dilation_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (self.config.dilation_px * 2 + 1, self.config.dilation_px * 2 + 1),
+            )
+            motion_mask = cv2.dilate(motion_mask, dilation_kernel, iterations=1)
+
+        # Find contours and filter by size
+        contours, _ = cv2.findContours(
+            motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        # Filter contours by noise floor
+        significant_contours = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > self.config.noise_floor:
+                significant_contours.append(contour)
+
+        # Create final motion mask from significant contours
+        final_motion_mask = np.zeros_like(motion_mask)
+        if significant_contours:
+            cv2.fillPoly(final_motion_mask, significant_contours, 255)
+
+        # Stats
+        motion_area = np.sum(final_motion_mask > 0)
+        roi_area = np.sum(roi_mask > 0)
+
+        # Resolve min_area_px based on mode
+        if self.config.min_area_mode == "roi_percent":
+            min_area_px = int((self.config.min_area_roi_percent / 100.0) * max(1, roi_area))
+        else:
+            min_area_px = int(self.config.min_area_px)
+
+        # Check if motion area exceeds threshold
+        significant_motion = motion_area >= min_area_px
+
+        # Apply cooldown logic
+        if significant_motion:
+            self.last_motion_time = datetime.now()
+            self.cooldown_counter = 0
+            self.stats["frames_with_motion"] += 1
+        else:
+            if self.cooldown_counter < self.config.cooldown_frames:
+                self.cooldown_counter += 1
+                # Still in cooldown - check if we recently had motion
+                if (
+                    self.last_motion_time
+                    and datetime.now() - self.last_motion_time < timedelta(seconds=2)
+                ):
+                    significant_motion = True
+                    self.stats["frames_skipped_cooldown"] += 1
+                else:
+                    self.stats["frames_skipped_no_motion"] += 1
+            else:
+                self.stats["frames_skipped_no_motion"] += 1
+
+        # Update state AFTER computation
+        self.previous_gray = gray.copy()
+
+        return MotionResult(
+            motion_detected=significant_motion,
+            pixels_changed=motion_area,
+            contour_count=len(significant_contours),
+            include_mask_area=roi_area,
+            motion_in_include_area=motion_area,
+            debug={
+                "mean_diff_masked": float(mean_val),
+                "dynamic_thresh": float(dynamic_thresh),
+                "min_area_px_resolved": int(min_area_px),
+                "roi_area": int(roi_area),
+                "w_small": frame_small.shape[1],
+                "h_small": frame_small.shape[0],
+            }
+        )
+
+    def _detect_motion_legacy(self, gray: np.ndarray, roi_mask: np.ndarray) -> MotionResult:
+        """Legacy implementation for backward compatibility."""
         # Background subtraction
         fg_mask = self.bg_subtractor.apply(gray)
 
@@ -182,7 +308,7 @@ class MotionDetector:
             cv2.fillPoly(final_motion_mask, significant_contours, 255)
 
         # Intersect motion mask with include mask
-        motion_in_include = cv2.bitwise_and(final_motion_mask, include_mask_small)
+        motion_in_include = cv2.bitwise_and(final_motion_mask, roi_mask)
         motion_area = np.sum(motion_in_include > 0)
 
         # Check if motion area exceeds threshold
@@ -212,8 +338,16 @@ class MotionDetector:
             motion_detected=significant_motion,
             pixels_changed=motion_area,
             contour_count=len(significant_contours),
-            include_mask_area=np.sum(include_mask_small > 0),
+            include_mask_area=np.sum(roi_mask > 0),
             motion_in_include_area=motion_area,
+            debug={
+                "mean_diff_masked": float(cv2.mean(cv2.absdiff(self.previous_gray or gray, gray))[0]),
+                "dynamic_thresh": 25.0,
+                "min_area_px_resolved": int(self.config.min_area_px),
+                "roi_area": int(np.sum(roi_mask > 0)),
+                "w_small": gray.shape[1],
+                "h_small": gray.shape[0],
+            }
         )
 
     def update_zones(self, zones: List[ZoneConfig]) -> None:
