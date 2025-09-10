@@ -12,4 +12,9 @@ rtsp:
   password: "pass"   # optional, default - disabled
   default_query: "video&audio"  # optional, default codecs filters
 streams:
-  camera_x: rtsp://127.0.0.1/camera_x
+  camera_001: rtsp://somba-maluku-minipcbb:8554/camera-001
+  camera_002: rtsp://somba-maluku-minipcbb:8554/camera-001
+  camera_003: rtsp://somba-maluku-minipcbb:8554/camera-001
+  camera_001a: rtsp://admin:Bogor2025%23@103.155.46.226:554/Streaming/Channels/502/
+  camera_002a: rtsp://admin:Bogor2025%23@103.155.46.226:554/Streaming/Channels/702/
+  camera_003a: rtsp://admin:Bogor2025%23@103.155.46.226:554/Streaming/Channels/102/

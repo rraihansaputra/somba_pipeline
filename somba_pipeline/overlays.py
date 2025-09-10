@@ -87,41 +87,32 @@ def render_debug_overlay(
         _draw_label_box(img, label, (int(anchor[0]) + 4, int(anchor[1]) + 20))
 
     cv2.addWeighted(overlay, 0.35, img, 0.65, 0, img)
-    
+
     # Draw ROI-native motion mask if available
     if motion_debug and motion_debug.get("mask") is not None:
         mask = motion_debug["mask"]
         if mask.shape[:2] != (h, w):
             # Upsample the mask using nearest neighbor interpolation to avoid blur
             mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-        
+
         # Create a semi-transparent overlay for motion
         motion_overlay = img.copy()
         # Use a yellow tint for motion
         motion_overlay[mask > 0] = [100, 200, 255]  # BGR for yellow
         cv2.addWeighted(motion_overlay, 0.3, img, 0.7, 0, img)
-        
-        # Draw motion contours
+
+        # Draw ALL motion contours (including below threshold)
         contours = motion_debug.get("contours", [])
         if contours:
-            for contour in contours:
+            # Different colors for significant vs below-threshold contours
+            significant_count = motion_debug.get("significant_contours", 0)
+            for idx, contour in enumerate(contours):
                 if len(contour) >= 3:
                     contour_array = np.array(contour, dtype=np.int32)
-                    cv2.polylines(img, [contour_array], isClosed=True, color=BGR_YELLOW, thickness=2, lineType=cv2.LINE_AA)
-        
-        # Additional debug info from ROI-native motion detection
-        debug_info = motion_debug.get("debug", {})
-        if debug_info:
-            roi_area = debug_info.get("roi_area", 0)
-            min_area = debug_info.get("min_area_px_resolved", 0)
-            mean_diff = debug_info.get("mean_diff_masked", 0)
-            threshold = debug_info.get("dynamic_thresh", 0)
-            
-            debug_text = f"ROI: {roi_area}px | Min: {min_area}px"
-            _draw_label_box(img, debug_text, (10, 55))
-            
-            debug_text = f"Mean: {mean_diff:.1f} | Thr: {threshold:.1f}"
-            _draw_label_box(img, debug_text, (10, 80))
+                    # Yellow for significant, light gray for below threshold
+                    color = BGR_YELLOW if idx < significant_count else (150, 150, 150)
+                    thickness = 2 if idx < significant_count else 1
+                    cv2.polylines(img, [contour_array], isClosed=True, color=color, thickness=thickness, lineType=cv2.LINE_AA)
 
     # Draw detections
     if detections:
@@ -145,29 +136,48 @@ def render_debug_overlay(
     if motion_debug:
         active = bool(motion_debug.get("active", False))
         gate_reason = motion_debug.get("gate_reason", "")
+
+        # Main motion status with threshold indicator
         status_txt = "ON" if active else "OFF"
-        chip_txt = f"MOTION: {status_txt}"
-        if gate_reason:
-            chip_txt += f" ({gate_reason})"
+        threshold_status = " (ABOVE)" if gate_reason == "above" else " (BELOW)" if gate_reason == "below" else f" ({gate_reason})"
+        chip_txt = f"MOTION: {status_txt}{threshold_status}"
         _draw_label_box(img, chip_txt, (10, 30))
-        
-        # Additional debug info from ROI-native motion detection
-        debug_info = motion_debug.get("debug", {})
-        if debug_info:
-            roi_area = debug_info.get("roi_area", 0)
-            min_area = debug_info.get("min_area_px_resolved", 0)
-            mean_diff = debug_info.get("mean_diff_masked", 0)
-            threshold = debug_info.get("dynamic_thresh", 0)
-            
-            debug_text = f"ROI: {roi_area}px | Min: {min_area}px"
-            _draw_label_box(img, debug_text, (10, 55))
-            
-            debug_text = f"Mean: {mean_diff:.1f} | Thr: {threshold:.1f}"
-            _draw_label_box(img, debug_text, (10, 80))
+
+        # Enhanced motion metrics
+        raw_pixels = motion_debug.get("raw_motion_pixels", 0)
+        filtered_pixels = motion_debug.get("filtered_motion_area", 0)
+        roi_area = motion_debug.get("roi_area", 0)
+        raw_percent = motion_debug.get("raw_motion_percent", 0.0)
+        filtered_percent = motion_debug.get("filtered_motion_percent", 0.0)
+
+        # Display raw motion (always shown)
+        raw_text = f"Raw Motion: {raw_pixels}/{roi_area}px ({raw_percent:.2f}%)"
+        _draw_label_box(img, raw_text, (10, 55))
+
+        # Display filtered motion vs threshold
+        min_area = motion_debug.get("min_area_px", 0)
+        threshold_percent = motion_debug.get("threshold_percent", 0.0)
+        filtered_text = f"Filtered: {filtered_pixels}px ({filtered_percent:.2f}%) | Threshold: {min_area}px ({threshold_percent:.2f}%)"
+        # Color based on threshold status
+        bg_color = BGR_GREEN if gate_reason == "above" else BGR_RED if gate_reason == "below" else BGR_YELLOW
+        _draw_label_box(img, filtered_text, (10, 80), bg=bg_color)
+
+        # Display contour counts
+        total_contours = motion_debug.get("total_contours", 0)
+        significant = motion_debug.get("significant_contours", 0)
+        below_threshold = motion_debug.get("below_threshold_contours", 0)
+        contour_text = f"Contours: {total_contours} total ({significant} significant, {below_threshold} below noise floor)"
+        _draw_label_box(img, contour_text, (10, 105))
+
+        # Display noise floor setting
+        noise_floor = motion_debug.get("noise_floor", 0)
+        noise_text = f"Noise Floor: {noise_floor}px"
+        _draw_label_box(img, noise_text, (10, 130))
 
     # Inference state chip (if provided)
     if inference_state:
-        _draw_label_box(img, inference_state, (10, 105))
+        # Move down to accommodate more motion debug info
+        _draw_label_box(img, inference_state, (10, 155))
 
     # HUD with timestamp / FPS
     if timestamp is not None or show_fps is not None:

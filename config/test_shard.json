@@ -1,25 +1,13 @@
 {
   "runner_id": "runner-test-001",
   "shard_id": "shard-0",
-  "max_fps": 6,
+  "max_fps": 15,
   "sources": [
     {
       "camera_uuid": "cam-001",
-      "url": "rtsp://127.0.0.1:8554/camera_001",
+      "url": "rtsp://somba-maluku-minipcbb:8554/camera-001",
       "site_id": "site-A",
-      "tenant_id": "tenant-01"
-    },
-    {
-      "camera_uuid": "cam-002",
-      "url": "rtsp://127.0.0.1:8554/camera_002",
-      "site_id": "site-A",
-      "tenant_id": "tenant-01"
-    },
-    {
-      "camera_uuid": "cam-003",
-      "url": "rtsp://127.0.0.1:8554/camera_003",
-      "site_id": "site-B",
-      "tenant_id": "tenant-01"
+      "tenant_id": "tenant-ams"
     }
   ],
   "amqp": {
@@ -38,58 +26,28 @@
     "cam-001": {
       "camera_uuid": "cam-001",
       "zones": [
-        {
-          "zone_id": 1,
-          "name": "driveway",
-          "kind": "include",
-          "priority": 100,
-          "polygon": [[100, 100], [700, 100], [700, 500], [200, 500]],
-          "allow_labels": ["person", "truck"],
-          "min_score": 0.25
-        },
-        {
-          "zone_id": 2,
-          "name": "neighbor_lawn",
-          "kind": "exclude",
-          "priority": 200,
-          "polygon": [[0, 0], [700, 0], [700, 100], [0, 100]],
-          "deny_labels": ["person", "car"]
-        }
       ],
       "motion_gating": {
         "enabled": true,
-        "downscale": 0.5,
+        "downscale": 1.0,
         "dilation_px": 6,
-        "min_area_px": 150,
+        "min_area_px": 1000,
         "cooldown_frames": 2,
-        "noise_floor": 12
-      },
-      "allow_labels": ["person", "car", "truck"],
-      "deny_labels": [],
-      "min_score": 0.30,
-      "zone_test": "center",
-      "iou_threshold": 0.10
+        "noise_floor": 0,
+        "max_inference_interval_seconds": 5
+      }
     },
     "cam-002": {
       "camera_uuid": "cam-002",
-      "zones": [
-        {
-          "zone_id": 1,
-          "name": "area_persiapan",
-          "kind": "include",
-          "priority": 100,
-          "polygon": [[250, 0], [500, 0], [600, 200], [600, 480], [100, 480]],
-          "allow_labels": ["person"],
-          "min_score": 0.3
-        }
-      ],
+      "zones": [],
       "motion_gating": {
         "enabled": true,
         "downscale": 0.5,
         "dilation_px": 6,
-        "min_area_px": 30,
+        "min_area_px": 10,
         "cooldown_frames": 2,
-        "noise_floor": 10
+        "noise_floor": 0,
+        "max_inference_interval_seconds": 5
       },
       "allow_labels": ["person"],
       "deny_labels": [],
@@ -111,7 +69,9 @@
         }
       ],
       "motion_gating": {
-        "enabled": false
+        "enabled": true,
+        "min_area_px": 50,
+        "noise_floor": 0
       },
       "allow_labels": null,
       "deny_labels": [],

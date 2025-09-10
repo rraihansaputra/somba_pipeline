@@ -49,6 +49,9 @@ from .debug_vis import DebugManager
 from .overlays import render_debug_overlay
 from .scaling import resolve_proc_size
 from .zones import ZoneMaskBuilder
+from .zero_copy_motion_detector import MotionData
+from .motion_detection import MotionResult
+from typing import Tuple
 
 # Configure logging
 logging.basicConfig(
@@ -104,13 +107,31 @@ class ProductionWorker:
             camera_configs, self.frame_width, self.frame_height
         )
 
-        # Initialize individual motion detectors
+        # Initialize optimized motion detection components
         from .motion_detection import MotionDetector
+        from .zero_copy_motion_detector import ZeroCopyMotionDetector
+        from .inference_timeout_manager import InferenceTimeoutManager
+        from .performance_monitor import PerformanceMonitor
 
+        # Original motion detectors (fallback)
         self.motion_detectors: Dict[str, MotionDetector] = {}
+
+        # Optimized motion detection components
+        self.optimized_motion_detectors: Dict[str, ZeroCopyMotionDetector] = {}
+        self.timeout_managers: Dict[str, InferenceTimeoutManager] = {}
+        self.performance_monitors: Dict[str, PerformanceMonitor] = {}
+
+        # Optimization statistics
+        self.inference_decisions = {
+            "motion_triggered": 0,
+            "timeout_triggered": 0,
+            "skipped_no_motion": 0,
+            "skipped_cooldown": 0,
+        }
 
         for camera_uuid, camera_config in camera_configs.items():
             if camera_config.motion_gating.enabled:
+                # Initialize original motion detector (fallback)
                 self.motion_detectors[camera_uuid] = MotionDetector(
                     camera_uuid=camera_uuid,
                     motion_config=camera_config.motion_gating,
@@ -118,6 +139,36 @@ class ProductionWorker:
                     frame_width=self.frame_width,
                     frame_height=self.frame_height,
                 )
+
+                # Initialize optimized zero-copy motion detector
+                self.optimized_motion_detectors[camera_uuid] = ZeroCopyMotionDetector(
+                    camera_uuid=camera_uuid,
+                    motion_config=camera_config.motion_gating,
+                    zones=camera_config.zones,
+                    frame_width=self.frame_width,
+                    frame_height=self.frame_height,
+                )
+
+                # Initialize timeout manager
+                timeout_seconds = getattr(
+                    camera_config.motion_gating,
+                    'max_inference_interval_seconds',
+                    30.0
+                )
+                self.timeout_managers[camera_uuid] = InferenceTimeoutManager(
+                    camera_uuid=camera_uuid,
+                    timeout_seconds=timeout_seconds,
+                    min_interval_seconds=1.0,
+                    adaptive_timeout=True,
+                )
+
+                # Initialize performance monitor
+                self.performance_monitors[camera_uuid] = PerformanceMonitor(
+                    camera_uuid=camera_uuid,
+                    window_size=60,
+                    sample_interval=1.0,
+                )
+                self.performance_monitors[camera_uuid].start_monitoring()
 
         # Initialize metrics
         self._init_metrics()
@@ -379,7 +430,7 @@ class ProductionWorker:
                 success = await self.lease_manager.send_heartbeat(
                     self.lease_id,
                     stats,
-                    CameraStatus.ONLINE if self.ready else CameraStatus.OFFLINE,
+                    "ONLINE" if self.ready else "OFFLINE",  # Temporary: comment out CameraStatus until defined
                 )
 
                 if success:
@@ -638,7 +689,75 @@ class ProductionWorker:
             # Apply motion detection if enabled for this camera
             skipped_by_motion = False
 
-            if camera_uuid in self.motion_detectors:
+            if camera_uuid in self.optimized_motion_detectors:
+                # Use optimized zero-copy motion detector
+                motion_detector = self.optimized_motion_detectors[camera_uuid]
+                timeout_manager = self.timeout_managers[camera_uuid]
+                perf_monitor = self.performance_monitors[camera_uuid]
+
+                # Zero-copy motion detection
+                motion_start_time = time.time()
+                motion_data = motion_detector.process_frame(video_frame.image)
+                motion_processing_time = time.time() - motion_start_time
+
+                # Convert MotionData to MotionResult for compatibility
+                motion_result = self._motion_data_to_result(motion_data)
+
+                # Make inference decision
+                inference_decision = timeout_manager.should_trigger_inference(motion_data.has_motion)
+
+                # Track decision statistics
+                if inference_decision.should_infer:
+                    if inference_decision.reason == "motion_detected":
+                        self.inference_decisions["motion_triggered"] += 1
+                    elif "timeout" in inference_decision.reason:
+                        self.inference_decisions["timeout_triggered"] += 1
+                else:
+                    self.inference_decisions["skipped_no_motion"] += 1
+
+                # Update performance monitor
+                perf_monitor.update_inference_metrics(
+                    inference_rate=1.0 if inference_decision.should_infer else 0.0,
+                    frame_rate=1.0,
+                    motion_rate=1.0 if motion_data.has_motion else 0.0,
+                )
+
+                # Log decision (elevated to INFO for debugging)
+                logger.debug(
+                    f"Worker inference decision for {camera_uuid}: "
+                    f"{inference_decision.reason} (has_motion: {motion_data.has_motion}, "
+                    f"motion_area: {motion_data.motion_area})"
+                )
+
+                # Track decision statistics (existing)
+                if inference_decision.should_infer:
+                    if inference_decision.reason == "motion_detected":
+                        self.inference_decisions["motion_triggered"] += 1
+                    elif "timeout" in inference_decision.reason:
+                        self.inference_decisions["timeout_triggered"] += 1
+                else:
+                    self.inference_decisions["skipped_no_motion"] += 1
+
+                # Skip processing if no inference should run
+                if not inference_decision.should_infer:
+                    skipped_by_motion = True
+                    self.frames_skipped_motion_total.labels(camera=camera_uuid).inc()
+                    self._last_infer_state[camera_uuid] = "SKIP"
+
+                    # Render and publish debug frame (throttled)
+                    self._publish_debug(
+                        cam=camera_uuid,
+                        frame_bgr=video_frame.image,
+                        predictions=None,
+                        skipped_by_motion=True,
+                        fps=self._calculate_fps(camera_uuid),
+                    )
+                    # IMPORTANT: skip processing since inference result is not needed
+                    # BUT we still need to update the motion detector state for the next frame
+                    return
+
+            elif camera_uuid in self.motion_detectors:
+                # Fallback to original motion detector
                 motion_detector = self.motion_detectors[camera_uuid]
                 motion_result = motion_detector.detect_motion(video_frame.image)
 
@@ -669,31 +788,82 @@ class ProductionWorker:
                 mask = None if isinstance(raw_mask, (bool, np.bool_, int, float)) else raw_mask
                 raw_zone_hits = getattr(motion_result, "zone_hits", None)
 
-                def _as_zone_hits(v) -> list[str]:
-                    # mirror drawer’s logic, but lighter
-                    if v is None or v is False:
-                        return []
-                    if v is True:
-                        return ["true"]
-                    if isinstance(v, (str, bytes, bytearray)):
-                        try:
-                            return [v.decode("utf-8")] if isinstance(v, (bytes, bytearray)) else [v]
-                        except Exception:
-                            return [str(v)]
-                    if isinstance(v, dict):
-                        return [str(k) for k in v.keys()]
-                    try:
-                        from collections.abc import Iterable
-                        if isinstance(v, Iterable) and not isinstance(v, (str, bytes, bytearray)):
-                            return [str(x) for x in v]
-                    except Exception:
-                        pass
-                    return [str(v)]
+            # Update camera metadata for optimized detector (if not already done)
+            if camera_uuid in self.optimized_motion_detectors and camera_uuid not in self._camera_meta:
+                # 1) Update per-camera meta (so /debug/start can derive width/height/fps)
+                h, w = video_frame.image.shape[:2]
+                fps_val = float(getattr(video_frame, "fps", 0) or 0)
+                ts_ms = int(getattr(video_frame, "ts_ms", int(time.time() * 1000)))
 
-                zone_hits = _as_zone_hits(raw_zone_hits)
+                # Build camera configuration dict for overlay (include zones)
+                cam_cfg = {}
+                try:
+                    cam_cfg_obj = self.config.cameras.get(camera_uuid)
+                    if cam_cfg_obj:
+                        cam_cfg = cam_cfg_obj.dict()
+                except Exception:
+                    cam_cfg = {}
+
+                self._camera_meta[camera_uuid] = {
+                    "width": w,
+                    "height": h,
+                    "fps": int(fps_val or 10),
+                    "zones": cam_cfg.get("zones", [])
+                }
+
+            # Build motion state for overlays (common for both optimized and fallback)
+            if camera_uuid in self.optimized_motion_detectors:
+                # For optimized detector, use motion_data directly
+                motion_on = motion_data.has_motion
+                raw_mask = motion_data.final_motion_mask
+                mask = raw_mask
+
+                # Convert contours to format expected by overlay
+                contours = []
+                if motion_data.significant_contours:
+                    for contour in motion_data.significant_contours:
+                        # Scale contours back to original frame size if needed
+                        if self.optimized_motion_detectors[camera_uuid].config.downscale < 1.0:
+                            scale = 1.0 / self.optimized_motion_detectors[camera_uuid].config.downscale
+                            scaled_contour = contour.astype(np.float32) * scale
+                            contours.append(scaled_contour.astype(np.int32))
+                        else:
+                            contours.append(contour)
+
+                raw_zone_hits = ["motion"] if motion_on else []
+            else:
+                # For fallback detector, use motion_result
+                motion_on = bool(motion_result.motion_detected)
+                raw_mask = getattr(motion_result, "mask", None)
+                mask = None if isinstance(raw_mask, (bool, np.bool_, int, float)) else raw_mask
+                raw_zone_hits = getattr(motion_result, "zone_hits", None)
                 contours = None
-                if mask is not None:
-                    contours = self._make_contours(mask)
+
+            def _as_zone_hits(v) -> list[str]:
+                # mirror drawer’s logic, but lighter
+                if v is None or v is False:
+                    return []
+                if v is True:
+                    return ["true"]
+                if isinstance(v, (str, bytes, bytearray)):
+                    try:
+                        return [v.decode("utf-8")] if isinstance(v, (bytes, bytearray)) else [v]
+                    except Exception:
+                        return [str(v)]
+                if isinstance(v, dict):
+                    return [str(k) for k in v.keys()]
+                try:
+                    from collections.abc import Iterable
+                    if isinstance(v, Iterable) and not isinstance(v, (str, bytes, bytearray)):
+                        return [str(x) for x in v]
+                except Exception:
+                    pass
+                return [str(v)]
+
+            zone_hits = _as_zone_hits(raw_zone_hits)
+            contours = None
+            if mask is not None:
+                contours = self._make_contours(mask)
 
                 self._motion_state[camera_uuid] = {
                     "on": motion_on,
@@ -701,16 +871,42 @@ class ProductionWorker:
                     "contours": contours,
                     "zone_hits": zone_hits,
                 }
-                self._motion_debug[camera_uuid] = {
-                    "mask": mask,
-                    "contours": contours,
-                    "active": motion_on,
-                    "cooldown": int(getattr(motion_result, "cooldown_frames_left", 0)),
-                    "gate_reason": str(getattr(motion_result, "gate_reason", "")),
-                    "min_area_px": int(getattr(motion_result, "min_area_px", 0)),
-                }
+                # Update motion debug state based on detector type
+                if camera_uuid in self.optimized_motion_detectors:
+                    # For optimized detector, use enhanced motion_data debug info
+                    self._motion_debug[camera_uuid] = {
+                        "mask": mask,
+                        "contours": motion_data.debug.get("all_contours", contours),  # Use ALL contours for display
+                        "active": motion_on,
+                        "cooldown": motion_data.debug.get("cooldown_frames_left", 0),
+                        "gate_reason": motion_data.debug.get("threshold_status", "no_motion"),
+                        "min_area_px": int(motion_data.debug.get("min_area_px", 0)),
+                        "motion_area": motion_data.motion_area,
+                        # Enhanced debug metrics
+                        "raw_motion_pixels": motion_data.debug.get("raw_motion_pixels", 0),
+                        "filtered_motion_area": motion_data.debug.get("filtered_motion_area", 0),
+                        "raw_motion_percent": motion_data.debug.get("raw_motion_percent", 0.0),
+                        "filtered_motion_percent": motion_data.debug.get("filtered_motion_percent", 0.0),
+                        "threshold_percent": motion_data.debug.get("threshold_percent", 0.0),
+                        "roi_area": motion_data.debug.get("roi_area", 0),
+                        "total_contours": motion_data.debug.get("total_contours", 0),
+                        "significant_contours": motion_data.debug.get("significant_contours", 0),
+                        "below_threshold_contours": motion_data.debug.get("below_threshold_contours", 0),
+                        "noise_floor": motion_data.debug.get("noise_floor", 0),
+                    }
+                else:
+                    # For fallback detector, use motion_result
+                    self._motion_debug[camera_uuid] = {
+                        "mask": mask,
+                        "contours": contours,
+                        "active": motion_on,
+                        "cooldown": int(getattr(motion_result, "cooldown_frames_left", 0)),
+                        "gate_reason": str(getattr(motion_result, "gate_reason", "")),
+                        "min_area_px": int(getattr(motion_result, "min_area_px", 0)),
+                    }
 
-                if not motion_result.motion_detected:
+                # Skip processing if no motion detected (for fallback detector)
+                if camera_uuid in self.motion_detectors and not motion_result.motion_detected:
                     skipped_by_motion = True
                     self.frames_skipped_motion_total.labels(camera=camera_uuid).inc()
                     self._last_infer_state[camera_uuid] = "SKIP"
@@ -726,15 +922,26 @@ class ProductionWorker:
                     # IMPORTANT: still skip inference
                     return
 
-                logger.debug(
-                    f"Motion detected {camera_uuid}: "
-                    f"{motion_result.pixels_changed}px in {motion_result.motion_in_include_area}px include area"
-                )
+                # Log enhanced motion detection metrics
+                if camera_uuid in self.optimized_motion_detectors:
+                    logger.debug(
+                        f"Motion detected {camera_uuid}: "
+                        f"raw={motion_data.debug.get('raw_motion_pixels', 0)}px ({motion_data.debug.get('raw_motion_percent', 0):.1f}%), "
+                        f"filtered={motion_data.motion_area}px ({motion_data.debug.get('filtered_motion_percent', 0):.1f}%), "
+                        f"threshold={motion_data.debug.get('min_area_px', 0)}px ({motion_data.debug.get('threshold_percent', 0):.1f}%), "
+                        f"contours={motion_data.debug.get('total_contours', 0)} total, "
+                        f"{motion_data.debug.get('significant_contours', 0)} significant"
+                    )
+                else:
+                    logger.debug(
+                        f"Motion detected {camera_uuid}: "
+                        f"{motion_result.pixels_changed}px in {motion_result.motion_in_include_area}px include area (fallback)"
+                    )
 
             # Process detections through zone attribution
             raw_detections = predictions.get("predictions", []) if predictions else []
             if len(raw_detections.class_id):
-                logger.info(f"{raw_detections=}")
+                logger.debug(f"{raw_detections=}")
             self.detections_raw_total.labels(camera=camera_uuid).inc(
                 len(raw_detections)
             )
@@ -1688,6 +1895,58 @@ class ProductionWorker:
             camera_uuid = source["camera_uuid"]
             self.camera_states[camera_uuid] = "CONNECTING"
             self.stream_up.labels(camera_uuid=camera_uuid).set(0)
+
+    def _motion_data_to_result(self, motion_data: MotionData) -> MotionResult:
+        """Convert MotionData to MotionResult for compatibility."""
+        from .motion_detection import MotionResult
+
+        return MotionResult(
+            motion_detected=motion_data.has_motion,
+            pixels_changed=motion_data.motion_area,
+            contour_count=motion_data.contour_count,
+            include_mask_area=motion_data.include_mask_area,
+            motion_in_include_area=motion_data.motion_area,
+            debug=motion_data.debug,
+        )
+
+    def get_optimization_stats(self) -> Dict[str, Any]:
+        """Get optimization statistics and performance metrics."""
+        stats = {
+            "inference_decisions": self.inference_decisions.copy(),
+            "total_frames": sum(self.frame_counts.values()),
+            "cameras_optimized": len(self.optimized_motion_detectors),
+            "cameras_fallback": len(self.motion_detectors) - len(self.optimized_motion_detectors),
+        }
+
+        # Calculate optimization metrics
+        total_decisions = sum(self.inference_decisions.values())
+        if total_decisions > 0:
+            stats["inference_reduction_rate"] = (
+                self.inference_decisions["skipped_no_motion"] / total_decisions
+            )
+            stats["motion_trigger_rate"] = (
+                self.inference_decisions["motion_triggered"] / total_decisions
+            )
+            stats["timeout_trigger_rate"] = (
+                self.inference_decisions["timeout_triggered"] / total_decisions
+            )
+
+        # Add motion detector stats
+        stats["motion_detectors"] = {}
+        for camera_uuid, detector in self.optimized_motion_detectors.items():
+            stats["motion_detectors"][camera_uuid] = detector.get_stats()
+
+        # Add timeout manager stats
+        stats["timeout_managers"] = {}
+        for camera_uuid, manager in self.timeout_managers.items():
+            stats["timeout_managers"][camera_uuid] = manager.get_stats()
+
+        # Add performance monitor stats
+        stats["performance_monitors"] = {}
+        for camera_uuid, monitor in self.performance_monitors.items():
+            stats["performance_monitors"][camera_uuid] = monitor.get_stats()
+
+        return stats
 
 
 def main():
