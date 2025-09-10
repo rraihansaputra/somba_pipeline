@@ -2,6 +2,19 @@
 Production worker implementing the full Phase 2 specifications.
 Wraps InferencePipeline with RabbitMQ, Prometheus, motion detection, and zones.
 """
+import os
+os.environ["OPENVINO_FORCE"]="1"                # <— force-reinsert OV even if the model removed it
+os.environ["OPENVINO_DEVICE_TYPE"]="GPU"
+os.environ["OPENVINO_PRECISION"]="FP16"
+# os.environ["OPENVINO_PRECISION"]="INT8"
+os.environ["OPENVINO_NUM_STREAMS"]="8"
+os.environ["OPENVINO_CACHE_DIR"]="/tmp/ov_cache"
+os.environ["OV_PATCH_VERBOSE"]="1"
+os.environ["ENABLE_FRAME_DROP_ON_VIDEO_FILE_RATE_LIMITING"]="True"
+os.environ["ENABLE_WORKFLOWS_PROFILING"]="True"
+
+import somba_pipeline.ov_ep_patch as ov_ep_patch
+ov_ep_patch.enable_openvino_gpu()
 
 import asyncio
 import json
@@ -14,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import asdict
-import os
+# import os
 import hashlib
 
 import aio_pika
@@ -1864,7 +1877,8 @@ class ProductionWorker:
         pipeline = InferencePipeline.init_with_workflow(
             api_key="M64AKKSKeEZdY6LizsYO",
             workspace_name="xstar",
-            workflow_id="detect-count-and-visualize",
+            # workflow_id="detect-count-and-visualize",
+            workflow_id="detect-count-and-visualize-rf-detr-base",
             video_reference=video_urls,
             on_prediction=sync_prediction_wrapper,
             status_update_handlers=[self._on_status_update],

@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'darwin'",
@@ -1723,6 +1723,27 @@ wheels = [
 ]
 
 [[package]]
+name = "onnxruntime-openvino"
+version = "1.22.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "coloredlogs" },
+    { name = "flatbuffers" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "protobuf" },
+    { name = "sympy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/f8/e58072535f96696cf18e8bff083ec2f6a7a2c8810f052727d2de6aff75fd/onnxruntime_openvino-1.22.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:693c4e63fb6ca8c10ebd4f67a87701f3f0628eb81f40960bdf7ae5c61b6aefdb", size = 63708673, upload-time = "2025-05-26T10:24:37.569Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/01/f08a012d0acb3f4c4f978f04a44ecae45303e6a9c4a5a3dc7e1bcf9deeaf/onnxruntime_openvino-1.22.0-cp311-cp311-win_amd64.whl", hash = "sha256:bf3953915244ed54c03ece5542d93e45526a6dc776cd8919c179759aae0d9e76", size = 12220371, upload-time = "2025-05-26T10:24:41.436Z" },
+    { url = "https://files.pythonhosted.org/packages/58/79/7ca125aaa651ed4084f755d2f2e10f949a7eaad6d01aaf9a9f8b9a153248/onnxruntime_openvino-1.22.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:000811fd42b027663cd15fcbbde049871164f7353ed28cab0219a1c10eef8e6d", size = 63708175, upload-time = "2025-05-26T10:24:46.739Z" },
+    { url = "https://files.pythonhosted.org/packages/38/73/2212a23aa2ac28e037ce844b86e6f367baddc05c83bce35992fa7be05c85/onnxruntime_openvino-1.22.0-cp312-cp312-win_amd64.whl", hash = "sha256:092446f82e52ab90d117120d321c7a726e58d77aab36d8796c29b7aa918ddb33", size = 12222493, upload-time = "2025-05-26T10:24:50.244Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/f3/8e4332aad38b22402b7671fedea60e930639b7f265a99f61f31dd8f8fce7/onnxruntime_openvino-1.22.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:a9879cfeb777a74b157383650aaf8762854a564f974ecdad55c7aa5962c7c534", size = 63707490, upload-time = "2025-05-26T10:24:54.779Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/0c/b7ac06f634403354225a5fc7a4b46cc4eb7fdd8a03dea3c77efd95e3c3dd/onnxruntime_openvino-1.22.0-cp313-cp313-win_amd64.whl", hash = "sha256:329ddda0093cb2702dc5774075d3f5520e7cb9b478a420ec7183ee45426d7027", size = 12222121, upload-time = "2025-05-26T10:24:58.746Z" },
+]
+
+[[package]]
 name = "onvif-zeep-async"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2737,6 +2758,7 @@ dependencies = [
     { name = "httpx" },
     { name = "inference" },
     { name = "numpy" },
+    { name = "onnxruntime-openvino" },
     { name = "opencv-python" },
     { name = "prometheus-client" },
     { name = "psutil" },
@@ -2762,6 +2784,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "inference", specifier = ">=0.52.1" },
     { name = "numpy", specifier = ">=2.2.6" },
+    { name = "onnxruntime-openvino", specifier = ">=1.22.0" },
     { name = "opencv-python", specifier = ">=4.10.0.84" },
     { name = "prometheus-client", specifier = ">=0.22.1" },
     { name = "psutil", specifier = ">=7.0.0" },
