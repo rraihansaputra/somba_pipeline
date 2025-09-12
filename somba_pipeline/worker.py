@@ -11,7 +11,7 @@ os.environ["OPENVINO_NUM_STREAMS"]="8"
 os.environ["OPENVINO_CACHE_DIR"]="/tmp/ov_cache"
 os.environ["OV_PATCH_VERBOSE"]="1"
 os.environ["ENABLE_FRAME_DROP_ON_VIDEO_FILE_RATE_LIMITING"]="True"
-os.environ["ENABLE_WORKFLOWS_PROFILING"]="False"
+os.environ["ENABLE_WORKFLOWS_PROFILING"]="True"
 
 import somba_pipeline.ov_ep_patch as ov_ep_patch
 ov_ep_patch.enable_openvino_gpu()
@@ -185,6 +185,9 @@ class ProductionWorker:
         self._last_infer_state: Dict[str, str] = {}  # {cam: "INFER"|"SKIP"|"COOLDOWN"}
         self._last_detections: Dict[str, List[dict]] = {}  # {cam: [last detections]}
         self._debug_target_fps: int = int(os.getenv("DEBUG_FPS", "8"))  # throttle; 8 fps is plenty
+        # FPS tracking (EMA per camera)
+        self._fps_last_ts: Dict[str, float] = {}
+        self._fps_ema: Dict[str, float] = {}
 
         # When True, we have installed a motion-gating wrapper over the
         # pipeline's on_video_frame callable to avoid wasted inference.
@@ -215,65 +218,108 @@ class ProductionWorker:
     def _init_metrics(self):
         """Initialize Prometheus metrics."""
         # Gauges
+        # Camera-level gauges (include tenant/site)
         self.stream_up = Gauge(
-            "stream_up", "Stream connectivity status", ["camera_uuid"]
+            "stream_up", "Stream connectivity status", ["tenant_id", "site_id", "camera_uuid"]
         )
         self.last_frame_age = Gauge(
-            "last_frame_age_seconds", "Age of last frame", ["camera_uuid"]
+            "last_frame_age_seconds", "Age of last frame", ["tenant_id", "site_id", "camera_uuid"]
         )
-        self.stream_fps = Gauge("stream_fps", "Stream FPS", ["camera_uuid"])
+        self.stream_fps = Gauge(
+            "stream_fps", "Stream FPS (actual)", ["tenant_id", "site_id", "camera_uuid"]
+        )
         self.pipeline_fps = Gauge(
             "pipeline_fps", "Pipeline FPS", ["runner_id", "shard_id"]
         )
 
         # Histograms
         self.inference_latency = Histogram(
-            "inference_latency_seconds", "Inference latency", ["camera_uuid"]
+            "inference_latency_seconds", "Inference latency", ["tenant_id", "site_id", "camera_uuid"]
         )
         self.e2e_latency = Histogram(
-            "e2e_latency_seconds", "End-to-end latency", ["camera_uuid"]
+            "e2e_latency_seconds", "End-to-end latency", ["tenant_id", "site_id", "camera_uuid"]
         )
 
         # Counters
         self.stream_errors = Counter(
-            "stream_errors_total", "Stream errors", ["camera_uuid", "code"]
+            "stream_errors_total", "Stream errors", ["tenant_id", "site_id", "camera_uuid", "code"]
         )
         self.detections_published = Counter(
-            "detections_published_total", "Detections published", ["camera_uuid"]
+            "detections_published_total", "Frames with any published detections", ["tenant_id", "site_id", "camera_uuid"]
         )
 
         # Zone-specific metrics from Phase 2 spec
         self.frames_total = Counter(
-            "zones_frames_total", "Total frames processed", ["camera"]
+            "zones_frames_total", "Total frames processed", ["tenant_id", "site_id", "camera_uuid"]
         )
         self.frames_skipped_motion_total = Counter(
-            "zones_frames_skipped_motion_total", "Frames skipped by motion", ["camera"]
+            "zones_frames_skipped_motion_total", "Frames skipped by motion", ["tenant_id", "site_id", "camera_uuid"]
         )
         self.detections_raw_total = Counter(
-            "zones_detections_raw_total", "Raw detections before filtering", ["camera"]
+            "zones_detections_raw_total", "Raw detections before filtering", ["tenant_id", "site_id", "camera_uuid"]
         )
         self.detections_published_zone = Counter(
             "zones_detections_published_total",
             "Published detections",
-            ["camera", "zone_id", "label"],
+            ["tenant_id", "site_id", "camera_uuid", "zone_id", "label"],
         )
         self.detections_dropped_total = Counter(
             "zones_detections_dropped_total",
             "Dropped detections",
-            ["camera", "zone_id", "reason"],
+            ["tenant_id", "site_id", "camera_uuid", "zone_id", "reason"],
         )
         self.zones_config_hash = Gauge(
-            "zones_config_hash", "Zones config hash", ["camera"]
+            "zones_config_hash", "Zones config hash", ["tenant_id", "site_id", "camera_uuid"]
         )
 
         # Decision accounting: reasons why frames were inferred or skipped
         self.inference_decision_total = Counter(
             "inference_decision_total",
             "Count of inference gating decisions by reason",
-            ["camera", "reason"],
+            ["tenant_id", "site_id", "camera_uuid", "reason"],
+        )
+
+        # Motion activity and skip ratios per camera with tenant/site labels
+        self.motion_rate_gauge = Gauge(
+            "motion_rate",
+            "Fraction of frames with motion (0..1)",
+            ["tenant_id", "site_id", "camera_uuid"],
+        )
+        self.motion_skip_ratio_gauge = Gauge(
+            "motion_skip_ratio",
+            "Fraction of frames skipped by motion gating (0..1)",
+            ["tenant_id", "site_id", "camera_uuid"],
         )
 
         logger.info("Prometheus metrics initialized")
+
+    def _update_motion_rate_metrics(self, camera_uuid: str) -> None:
+        """Update motion rate and skip ratio gauges for a camera."""
+        try:
+            detector = self.optimized_motion_detectors.get(camera_uuid)
+            if not detector:
+                return
+            stats = detector.get_stats() or {}
+            motion_rate = float(stats.get("motion_rate", 0.0) or 0.0)
+            skip_ratio = float(stats.get("skip_rate", 0.0) or 0.0)
+            tenant_id = self._get_tenant_id(camera_uuid)
+            site_id = self._get_site_id(camera_uuid)
+            self.motion_rate_gauge.labels(
+                tenant_id=tenant_id, site_id=site_id, camera_uuid=camera_uuid
+            ).set(motion_rate)
+            self.motion_skip_ratio_gauge.labels(
+                tenant_id=tenant_id, site_id=site_id, camera_uuid=camera_uuid
+            ).set(skip_ratio)
+        except Exception:
+            # Metrics should never break the pipeline
+            pass
+
+    def _cam_labels(self, camera_uuid: str) -> Dict[str, str]:
+        return {
+            "tenant_id": self._get_tenant_id(camera_uuid),
+            "site_id": self._get_site_id(camera_uuid),
+            "camera_uuid": camera_uuid,
+        }
 
     def _calculate_config_hash(self) -> str:
         """Calculate SHA256 hash of the config file."""
@@ -375,7 +421,7 @@ class ProductionWorker:
             # Update config hash metrics
             for camera_uuid in camera_configs:
                 config_hash = self.zone_attributor.get_zones_config_hash(camera_uuid)
-                self.zones_config_hash.labels(camera=camera_uuid).set(config_hash)
+                self.zones_config_hash.labels(**self._cam_labels(camera_uuid)).set(config_hash)
 
             logger.info("Zone configurations reloaded successfully")
 
@@ -469,7 +515,7 @@ class ProductionWorker:
 
             # Update metrics
             config_hash = self.zone_attributor.get_zones_config_hash(camera_uuid)
-            self.zones_config_hash.labels(camera=camera_uuid).set(config_hash)
+            self.zones_config_hash.labels(**self._cam_labels(camera_uuid)).set(config_hash)
 
             logger.info(f"Configuration updated successfully for camera {camera_uuid}")
 
@@ -635,7 +681,9 @@ class ProductionWorker:
                 # Track latest activity; keep counters aligned with wrapper usage
                 self.last_frame_times[camera_uuid] = now_ts
                 self.frame_counts[camera_uuid] = self.frame_counts.get(camera_uuid, 0) + 1
-                self.frames_total.labels(camera=camera_uuid).inc()
+                self.frames_total.labels(**self._cam_labels(camera_uuid)).inc()
+                # Update actual ingest FPS EMA and gauge
+                ema_fps = self._tick_fps(camera_uuid)
 
                 # Optimized path: zero-copy motion detector
                 if camera_uuid in self.optimized_motion_detectors:
@@ -651,6 +699,9 @@ class ProductionWorker:
                     self._update_motion_state_from_motion_data(camera_uuid, vf, motion_data)
 
                     decision = timeout_manager.should_trigger_inference(motion_data.has_motion)
+
+                    # Update motion rate/skip ratio gauges
+                    self._update_motion_rate_metrics(camera_uuid)
 
                     # Decision accounting for analysis
                     if decision.should_infer:
@@ -669,7 +720,7 @@ class ProductionWorker:
                     # Prometheus counter by decision reason
                     try:
                         self.inference_decision_total.labels(
-                            camera=camera_uuid, reason=str(decision.reason)
+                            **self._cam_labels(camera_uuid), reason=str(decision.reason)
                         ).inc()
                     except Exception:
                         pass
@@ -677,7 +728,7 @@ class ProductionWorker:
                     # Perf monitor updates (lightweight rates only)
                     perf_monitor.update_inference_metrics(
                         inference_rate=1.0 if decision.should_infer else 0.0,
-                        frame_rate=1.0,
+                        frame_rate=float(ema_fps or 0.0),
                         motion_rate=1.0 if motion_data.has_motion else 0.0,
                     )
 
@@ -686,7 +737,7 @@ class ProductionWorker:
                         map_infer_index.append(idx)
                     else:
                         # Count skipped frames and publish a throttled debug frame snapshot
-                        self.frames_skipped_motion_total.labels(camera=camera_uuid).inc()
+                        self.frames_skipped_motion_total.labels(**self._cam_labels(camera_uuid)).inc()
                         self._publish_debug(
                             cam=camera_uuid,
                             frame_bgr=vf.image,
@@ -855,7 +906,9 @@ class ProductionWorker:
             if not self._use_motion_gating_wrapper:
                 self.last_frame_times[camera_uuid] = frame_timestamp
                 self.frame_counts[camera_uuid] = self.frame_counts.get(camera_uuid, 0) + 1
-                self.frames_total.labels(camera=camera_uuid).inc()
+                self.frames_total.labels(**self._cam_labels(camera_uuid)).inc()
+                # Update per-camera FPS EMA and gauge
+                self._tick_fps(camera_uuid)
 
             # Apply motion detection if enabled for this camera
             skipped_by_motion = False
@@ -892,7 +945,7 @@ class ProductionWorker:
                 # Update performance monitor
                 perf_monitor.update_inference_metrics(
                     inference_rate=1.0 if inference_decision.should_infer else 0.0,
-                    frame_rate=1.0,
+                    frame_rate=float(self._fps_ema.get(camera_uuid, 0.0)),
                     motion_rate=1.0 if motion_data.has_motion else 0.0,
                 )
 
@@ -902,6 +955,9 @@ class ProductionWorker:
                     f"{inference_decision.reason} (has_motion: {motion_data.has_motion}, "
                     f"motion_area: {motion_data.motion_area})"
                 )
+
+                # Update motion rate/skip ratio gauges
+                self._update_motion_rate_metrics(camera_uuid)
 
                 # Track decision statistics (existing)
                 if inference_decision.should_infer:
@@ -915,7 +971,7 @@ class ProductionWorker:
                 # Skip processing if no inference should run
                 if not inference_decision.should_infer:
                     skipped_by_motion = True
-                    self.frames_skipped_motion_total.labels(camera=camera_uuid).inc()
+                    self.frames_skipped_motion_total.labels(**self._cam_labels(camera_uuid)).inc()
                     self._last_infer_state[camera_uuid] = "SKIP"
 
                     # Render and publish debug frame (throttled)
@@ -958,7 +1014,9 @@ class ProductionWorker:
                 }
 
             # Build motion state for overlays (optimized detector)
-            if camera_uuid in self.optimized_motion_detectors:
+            # Only rebuild here when not using the motion-gating wrapper.
+            # When the wrapper is active, it already updates _motion_state and _motion_debug.
+            if camera_uuid in self.optimized_motion_detectors and not self._use_motion_gating_wrapper:
                 # For optimized detector, use motion_data directly
                 motion_on = motion_data.has_motion
                 raw_mask = motion_data.final_motion_mask
@@ -999,59 +1057,56 @@ class ProductionWorker:
                     pass
                 return [str(v)]
 
-            zone_hits = _as_zone_hits(raw_zone_hits)
-            contours = None
-            if mask is not None:
-                contours = self._make_contours(mask)
+            
+                zone_hits = _as_zone_hits(raw_zone_hits)
+                contours = None
+                if mask is not None:
+                    contours = self._make_contours(mask)
 
-                self._motion_state[camera_uuid] = {
-                    "on": motion_on,
-                    "mask": mask,             # keep original; draw will resize if needed
-                    "contours": contours,
-                    "zone_hits": zone_hits,
-                }
-                # Update motion debug state based on detector type
-                # For optimized detector, use enhanced motion_data debug info
-                self._motion_debug[camera_uuid] = {
-                    "mask": mask,
-                    "contours": motion_data.debug.get("all_contours", contours),  # Use ALL contours for display
-                    "active": motion_on,
-                    "cooldown": motion_data.debug.get("cooldown_frames_left", 0),
-                    "gate_reason": motion_data.debug.get("threshold_status", "no_motion"),
-                    "min_area_px": int(motion_data.debug.get("min_area_px", 0)),
-                    "motion_area": motion_data.motion_area,
-                    # Enhanced debug metrics
-                    "raw_motion_pixels": motion_data.debug.get("raw_motion_pixels", 0),
-                    "filtered_motion_area": motion_data.debug.get("filtered_motion_area", 0),
-                    "raw_motion_percent": motion_data.debug.get("raw_motion_percent", 0.0),
-                    "filtered_motion_percent": motion_data.debug.get("filtered_motion_percent", 0.0),
-                    "threshold_percent": motion_data.debug.get("threshold_percent", 0.0),
-                    "roi_area": motion_data.debug.get("roi_area", 0),
-                    "total_contours": motion_data.debug.get("total_contours", 0),
-                    "significant_contours": motion_data.debug.get("significant_contours", 0),
-                    "below_threshold_contours": motion_data.debug.get("below_threshold_contours", 0),
-                    "noise_floor": motion_data.debug.get("noise_floor", 0),
-                }
+                    self._motion_state[camera_uuid] = {
+                        "on": motion_on,
+                        "mask": mask,             # keep original; draw will resize if needed
+                        "contours": contours,
+                        "zone_hits": zone_hits,
+                    }
+                    # Update motion debug state based on detector type
+                    # For optimized detector, use enhanced motion_data debug info
+                    self._motion_debug[camera_uuid] = {
+                        "mask": mask,
+                        "contours": motion_data.debug.get("all_contours", contours),  # Use ALL contours for display
+                        "active": motion_on,
+                        "cooldown": motion_data.debug.get("cooldown_frames_left", 0),
+                        "gate_reason": motion_data.debug.get("threshold_status", "no_motion"),
+                        "min_area_px": int(motion_data.debug.get("min_area_px", 0)),
+                        "motion_area": motion_data.motion_area,
+                        # Enhanced debug metrics
+                        "raw_motion_pixels": motion_data.debug.get("raw_motion_pixels", 0),
+                        "filtered_motion_area": motion_data.debug.get("filtered_motion_area", 0),
+                        "raw_motion_percent": motion_data.debug.get("raw_motion_percent", 0.0),
+                        "filtered_motion_percent": motion_data.debug.get("filtered_motion_percent", 0.0),
+                        "threshold_percent": motion_data.debug.get("threshold_percent", 0.0),
+                        "roi_area": motion_data.debug.get("roi_area", 0),
+                        "total_contours": motion_data.debug.get("total_contours", 0),
+                        "significant_contours": motion_data.debug.get("significant_contours", 0),
+                        "below_threshold_contours": motion_data.debug.get("below_threshold_contours", 0),
+                        "noise_floor": motion_data.debug.get("noise_floor", 0),
+                    }
 
-                # No fallback skip path; gating handled above for optimized detectors
+                    # No fallback skip path; gating handled above for optimized detectors
 
-                # Log enhanced motion detection metrics
-                logger.debug(
-                    f"Motion detected {camera_uuid}: "
-                    f"raw={motion_data.debug.get('raw_motion_pixels', 0)}px ({motion_data.debug.get('raw_motion_percent', 0):.1f}%), "
-                    f"filtered={motion_data.motion_area}px ({motion_data.debug.get('filtered_motion_percent', 0):.1f}%), "
-                    f"threshold={motion_data.debug.get('min_area_px', 0)}px ({motion_data.debug.get('threshold_percent', 0):.1f}%), "
-                    f"contours={motion_data.debug.get('total_contours', 0)} total, "
-                    f"{motion_data.debug.get('significant_contours', 0)} significant"
-                )
+                    # Log enhanced motion detection metrics
+                    logger.debug(
+                        f"Motion detected {camera_uuid}: "
+                        f"raw={motion_data.debug.get('raw_motion_pixels', 0)}px ({motion_data.debug.get('raw_motion_percent', 0):.1f}%), "
+                        f"filtered={motion_data.motion_area}px ({motion_data.debug.get('filtered_motion_percent', 0):.1f}%), "
+                        f"threshold={motion_data.debug.get('min_area_px', 0)}px ({motion_data.debug.get('threshold_percent', 0):.1f}%), "
+                        f"contours={motion_data.debug.get('total_contours', 0)} total, "
+                        f"{motion_data.debug.get('significant_contours', 0)} significant"
+                    )
 
             # Process detections through zone attribution
             raw_detections = predictions.get("predictions", []) if predictions else []
-            if len(raw_detections.class_id):
-                logger.debug(f"{raw_detections=}")
-            self.detections_raw_total.labels(camera=camera_uuid).inc(
-                len(raw_detections)
-            )
+            # Do not assume raw_detections is a list; counting handled after zone processing
 
             # Apply zone attribution and filtering
             published_objects, zone_stats = (
@@ -1063,16 +1118,26 @@ class ProductionWorker:
             # Update zone metrics
             for obj in published_objects:
                 self.detections_published_zone.labels(
-                    camera=camera_uuid,
+                    **self._cam_labels(camera_uuid),
                     zone_id=str(obj.primary_zone_id),
                     label=obj.label,
                 ).inc()
+
+            # Update raw detections counter robustly using zone_stats
+            try:
+                total_raw = 0
+                for zs in zone_stats.values():
+                    total_raw += int(zs.get("objects", 0)) + int(zs.get("dropped", 0))
+                if total_raw:
+                    self.detections_raw_total.labels(**self._cam_labels(camera_uuid)).inc(total_raw)
+            except Exception:
+                pass
 
             # Update dropped metrics
             for zone_id_str, stats in zone_stats.items():
                 if stats["dropped"] > 0:
                     self.detections_dropped_total.labels(
-                        camera=camera_uuid, zone_id=zone_id_str, reason="zone_filter"
+                        **self._cam_labels(camera_uuid), zone_id=zone_id_str, reason="zone_filter"
                     ).inc(stats["dropped"])
 
             # Create detection event
@@ -1119,17 +1184,18 @@ class ProductionWorker:
             )
 
             # Update published metrics (fix reference)
-            self.detections_published.labels(camera_uuid=camera_uuid).inc()
+            # Count frames with any published detections
+            self.detections_published.labels(**self._cam_labels(camera_uuid)).inc(int(len(published_objects) > 0))
 
             # Update inference latency
             if "time" in predictions:
-                self.inference_latency.labels(camera_uuid=camera_uuid).observe(
+                self.inference_latency.labels(**self._cam_labels(camera_uuid)).observe(
                     predictions["time"]
                 )
 
             # Update e2e latency
             e2e_latency = self._calculate_e2e_latency(video_frame)
-            self.e2e_latency.labels(camera_uuid=camera_uuid).observe(e2e_latency)
+            self.e2e_latency.labels(**self._cam_labels(camera_uuid)).observe(e2e_latency)
 
             logger.debug(
                 f"Processed prediction for {camera_uuid}: "
@@ -1141,7 +1207,7 @@ class ProductionWorker:
                 f"Error processing prediction for {camera_uuid}: {e}", exc_info=True
             )
             self.stream_errors.labels(
-                camera_uuid=camera_uuid, code="PREDICTION_ERROR"
+                **self._cam_labels(camera_uuid), code="PREDICTION_ERROR"
             ).inc()
 
     async def _on_prediction(self, predictions: Optional[Dict], video_frames):
@@ -1226,7 +1292,7 @@ class ProductionWorker:
             self.camera_states[camera_uuid] = state
 
             # Update metrics
-            self.stream_up.labels(camera_uuid=camera_uuid).set(
+            self.stream_up.labels(**self._cam_labels(camera_uuid)).set(
                 1 if state == "STREAMING" else 0
             )
 
@@ -1268,7 +1334,7 @@ class ProductionWorker:
         """Handle error status updates."""
         error_code = update.payload.get("error_type", "UNKNOWN")
 
-        self.stream_errors.labels(camera_uuid=camera_uuid, code=error_code).inc()
+        self.stream_errors.labels(**self._cam_labels(camera_uuid), code=error_code).inc()
 
         error_event = ErrorEvent(
             type="stream.error",
@@ -1403,7 +1469,7 @@ class ProductionWorker:
                         frame_age = (
                             datetime.now(timezone.utc) - last_frame
                         ).total_seconds()
-                        self.last_frame_age.labels(camera_uuid=camera_uuid).set(
+                        self.last_frame_age.labels(**self._cam_labels(camera_uuid)).set(
                             frame_age
                         )
 
@@ -1550,8 +1616,10 @@ class ProductionWorker:
             port = int(qs.get("port", "5002"))
             ttl  = int(qs.get("ttl", "30"))
 
-            # Derive camera geometry/fps from your known state (fallbacks are safe)
-            # meta = await request.app["get_camera_meta"](cam)  # you may implement this; see below
+            # Derive camera geometry/fps from known state (fallbacks are safe)
+            try:
+                meta = request.app["get_camera_meta"](cam) or {}
+            except Exception:
                 meta = {}
             width  = int(meta.get("width", 1280))
             height = int(meta.get("height", 720))
@@ -1580,12 +1648,27 @@ class ProductionWorker:
         ])
 
         runner = web.AppRunner(app)
+        try:
             await runner.setup()
-
-        site = web.TCPSite(runner, "127.0.0.1", 8080)
+            # Configurable bind address/port via env
+            host = os.getenv("WORKER_HTTP_HOST", "0.0.0.0")
+            port = int(os.getenv("WORKER_HTTP_PORT", "8080"))
+            # Bind on all interfaces to avoid IPv4/IPv6 localhost issues
+            site = web.TCPSite(runner, host, port)
             await site.start()
-
-        logger.info("Health server started on http://127.0.0.1:8080")
+            logger.info(f"Health server started on http://{host}:{port}")
+        except Exception as e:
+            logger.error(f"Failed to start health server: {e}")
+            # Try fallback port
+            try:
+                host = os.getenv("WORKER_HTTP_HOST", "0.0.0.0")
+                port_fallback = int(os.getenv("WORKER_HTTP_FALLBACK_PORT", "8081"))
+                site = web.TCPSite(runner, host, port_fallback)
+                await site.start()
+                logger.info(f"Health server started on http://{host}:{port_fallback} (fallback)")
+            except Exception as ee:
+                logger.error(f"Failed to start health server on fallback :8081: {ee}")
+                return  # Give up starting the health server
 
         # Keep running until shutdown
         while self.running:
@@ -1638,9 +1721,31 @@ class ProductionWorker:
 
     def _calculate_fps(self, camera_uuid: str) -> float:
         """Calculate current FPS for camera."""
-        # Simple FPS calculation based on frame count and time
-        # In practice, would use a sliding window
+        # Return EMA-estimated ingest/processed FPS if available; fallback to pipeline watchdog FPS
+        ema = self._fps_ema.get(camera_uuid)
+        if isinstance(ema, (int, float)) and ema > 0:
+            return float(ema)
         return float(self.config.max_fps)
+
+    def _tick_fps(self, camera_uuid: str, now_ts: Optional[float] = None) -> float:
+        """Update per-camera FPS EMA and gauge; return current EMA."""
+        try:
+            t = now_ts if now_ts is not None else time.time()
+            last = self._fps_last_ts.get(camera_uuid)
+            if last is not None:
+                dt = max(1e-6, t - last)
+                inst_fps = 1.0 / dt
+                prev = self._fps_ema.get(camera_uuid, inst_fps)
+                # EMA smoothing
+                alpha = 0.2
+                ema = (1 - alpha) * prev + alpha * inst_fps
+                self._fps_ema[camera_uuid] = ema
+                # Update gauge
+            self.stream_fps.labels(**self._cam_labels(camera_uuid)).set(ema)
+            self._fps_last_ts[camera_uuid] = t
+            return float(self._fps_ema.get(camera_uuid, 0.0))
+        except Exception:
+            return 0.0
 
     def _calculate_e2e_latency(self, frame: VideoFrame) -> float:
         """Calculate end-to-end latency.
@@ -2016,7 +2121,7 @@ class ProductionWorker:
         for source in self.config.sources:
             camera_uuid = source["camera_uuid"]
             self.camera_states[camera_uuid] = "CONNECTING"
-            self.stream_up.labels(camera_uuid=camera_uuid).set(0)
+            self.stream_up.labels(**self._cam_labels(camera_uuid)).set(0)
 
     def get_optimization_stats(self) -> Dict[str, Any]:
         """Get optimization statistics and performance metrics."""
