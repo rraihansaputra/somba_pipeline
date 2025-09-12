@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 import logging
 
 from .schemas import MotionGatingConfig, ZoneConfig
-from .motion_detection import MotionResult, ZoneMaskBuilder
+from .zones import ZoneMaskBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,6 @@ class ZeroCopyMotionDetector:
 
         # Zone mask builder - will build masks when we know actual frame size
         self.mask_builder = None
-        self.include_mask = None
         self.include_mask_small = None
 
         logger.info(f"Zero-copy motion detector created for {camera_uuid}")
@@ -162,24 +161,17 @@ class ZeroCopyMotionDetector:
             # Allocate buffers with actual frame size
             self._allocate_memory_buffers(w, h)
 
-            # Build zone masks with actual frame size
-            self.mask_builder = ZoneMaskBuilder(w, h)
-            self.include_mask = self.mask_builder.build_include_mask(self.zones)
+            # Build zone masks using centralized ZoneMaskBuilder (already downscaled)
+            self.mask_builder = ZoneMaskBuilder((w, h), self.config.downscale)
+            zones_payload = [z.model_dump() if isinstance(z, ZoneConfig) else z for z in (self.zones or [])]
+            include_small, _ = self.mask_builder.build(zones_payload)
+            self.include_mask_small = include_small
 
-            # Check include mask coverage
-            include_area = np.sum(self.include_mask > 0)
-            total_area = self.include_mask.shape[0] * self.include_mask.shape[1]
-            logger.info(f"{self.camera_uuid} - Include mask: {include_area}/{total_area} pixels ({100*include_area/total_area:.1f}%)")
-
-            # Create downscaled include mask if needed
-            if self.config.downscale < 1.0:
-                self.include_mask_small = cv2.resize(
-                    self.include_mask,
-                    (self.process_width, self.process_height),
-                    interpolation=cv2.INTER_AREA
-                )
-            else:
-                self.include_mask_small = self.include_mask
+            # Check include mask coverage (on downscaled mask)
+            include_area = int(np.sum(self.include_mask_small > 0))
+            total_area = int(self.include_mask_small.shape[0] * self.include_mask_small.shape[1])
+            pct = (100.0 * include_area / max(1, total_area))
+            logger.info(f"{self.camera_uuid} - Include mask (small): {include_area}/{total_area} px ({pct:.1f}%)")
 
             self.buffers_initialized = True
             logger.info(f"{self.camera_uuid} - Buffers initialized for {w}x{h}, process size: {self.process_width}x{self.process_height}")
@@ -193,7 +185,7 @@ class ZeroCopyMotionDetector:
                 has_motion=True,
                 motion_area=0,
                 contour_count=0,
-                include_mask_area=np.sum(self.include_mask > 0),
+                include_mask_area=int(np.sum(self.include_mask_small > 0)) if self.include_mask_small is not None else 0,
                 significant_contours=[],
                 final_motion_mask=np.zeros((self.process_height, self.process_width), dtype=np.uint8),
                 debug={"disabled": True}
@@ -269,7 +261,7 @@ class ZeroCopyMotionDetector:
             include_mask_small = self.include_mask_small
         else:
             gray_small = self.gray_buffer
-            include_mask_small = self.include_mask
+            include_mask_small = self.include_mask_small
 
         # Ensure mask is binary uint8 0/255
         if include_mask_small.dtype != np.uint8:
@@ -523,6 +515,21 @@ class ZeroCopyMotionDetector:
         """Reset motion detection statistics."""
         for key in self.stats:
             self.stats[key] = 0
+
+    def update_zones(self, zones: List[ZoneConfig] | List[Dict[str, Any]]):
+        """Update zone configuration and rebuild masks if initialized."""
+        self.zones = zones
+        if self.buffers_initialized and self.actual_frame_width and self.actual_frame_height:
+            try:
+                self.mask_builder = ZoneMaskBuilder((self.actual_frame_width, self.actual_frame_height), self.config.downscale)
+                zones_payload = [z.model_dump() if isinstance(z, ZoneConfig) else z for z in (self.zones or [])]
+                include_small, _ = self.mask_builder.build(zones_payload)
+                self.include_mask_small = include_small
+                logger.info(
+                    f"{self.camera_uuid} - Zones updated; include mask rebuilt ({self.include_mask_small.shape[1]}x{self.include_mask_small.shape[0]})"
+                )
+            except Exception as e:
+                logger.error(f"{self.camera_uuid} - Failed to rebuild include mask after zone update: {e}")
 
     def should_infer(self) -> bool:
         """Check if inference should be triggered based on motion and timeout."""

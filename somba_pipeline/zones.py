@@ -13,15 +13,32 @@ class ZoneMaskBuilder:
         return np.array(pts_small, dtype=np.int32).reshape(-1, 1, 2)
 
     def build(self, zones: List[Dict]):
+        """
+        Build downscaled include/exclude masks.
+
+        Behavior:
+        - If one or more include zones are present → include = union(include zones)
+        - If no include zones are present → include = full frame
+        - Exclude zones are always subtracted from include
+        Returns (include_minus_exclude, exclude) as uint8 {0,255} masks sized (h_small, w_small).
+        """
         include = np.zeros((self.h_small, self.w_small), dtype=np.uint8)
         exclude = np.zeros_like(include)
 
+        has_include = False
+
         for z in zones or []:
             poly_small = self._poly_to_small(z["polygon"])
-            if z.get("kind", "include") == "include":
+            kind = z.get("kind", "include")
+            if kind == "include":
+                has_include = True
                 cv2.fillPoly(include, [poly_small], 255)
-            else:
+            elif kind == "exclude":
                 cv2.fillPoly(exclude, [poly_small], 255)
+
+        # If no include zones, default to full-frame include
+        if not has_include:
+            include.fill(255)
 
         include = ensure_mask_u8_255(include)
         exclude = ensure_mask_u8_255(exclude)
