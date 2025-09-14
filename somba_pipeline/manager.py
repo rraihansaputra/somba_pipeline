@@ -43,6 +43,9 @@ class ManagerProcess:
         self.config = config
         self.runner_id = config.runner_id
         self.shard_id = config.shard_id
+        # Temporary: tenant/site scoping (to be sourced from config in future)
+        self.tenant_id = os.getenv("RUNNER_TENANT_ID", "tenant-01")
+        self.site_id = os.getenv("RUNNER_SITE_ID", "site-A")
 
         # Lease management
         self.lease_manager = LeaseManager(config.control_plane)
@@ -102,8 +105,8 @@ class ManagerProcess:
 
             request = RunnerRegisterRequest(
                 runner_id=self.runner_id,
-                tenant_id="tenant-01",  # From config
-                site_id="site-A",  # From config
+                tenant_id=self.tenant_id,
+                site_id=self.site_id,
                 deployment_group="production",
                 deployment_version="v1.0.0",
                 host="localhost",
@@ -208,11 +211,12 @@ class ManagerProcess:
                 await asyncio.sleep(60)
 
     async def _get_available_cameras(self) -> List[str]:
-        """Get list of available cameras from control plane."""
+        """Get list of available cameras for our tenant/site from control plane (site-scoped)."""
         try:
-            return await self.cp_client.get_available_cameras()
+            cameras = await self.cp_client.get_cameras(self.tenant_id, self.site_id)
+            return [c.camera_uuid for c in cameras]
         except Exception as e:
-            logger.error(f"Failed to get available cameras: {e}")
+            logger.error(f"Failed to get site-scoped cameras: {e}")
             return []
 
     async def _acquire_camera_leases(self, camera_uuids: List[str]):
@@ -220,7 +224,7 @@ class ManagerProcess:
         for camera_uuid in camera_uuids:
             try:
                 lease = await self.lease_manager.acquire_camera_lease(
-                    camera_uuid, self.runner_id, self.shard_id
+                    camera_uuid, self.runner_id, self.shard_id, self.tenant_id, self.site_id
                 )
 
                 if lease:

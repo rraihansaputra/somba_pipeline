@@ -49,7 +49,12 @@ class LeaseManager:
         logger.info("LeaseManager initialized")
 
     async def acquire_camera_lease(
-        self, camera_uuid: str, runner_id: str, shard_id: str
+        self,
+        camera_uuid: str,
+        runner_id: str,
+        shard_id: str,
+        tenant_id: str,
+        site_id: str,
     ) -> Optional[Lease]:
         """Acquire lease for a specific camera."""
         try:
@@ -67,8 +72,8 @@ class LeaseManager:
                 camera_uuid=camera_uuid,
                 runner_id=runner_id,
                 shard_id=shard_id,
-                tenant_id="tenant-01",  # From config
-                site_id="site-A",  # From config
+                tenant_id=tenant_id,
+                site_id=site_id,
                 ttl_seconds=self.lease_ttl_seconds,
                 config_version="v1",
                 zone_version="v1",

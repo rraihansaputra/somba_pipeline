@@ -111,13 +111,7 @@ class WorkerProcess:
                 "runner_id": self.config.runner_id,
                 "shard_id": self.worker_id,
                 "max_fps": self.config.max_fps,
-                "sources": [
-                    {
-                        "camera_uuid": cam,
-                        "url": f"rtsp://admin:password@localhost:8554/{cam}",
-                    }
-                    for cam in cameras
-                ],
+                "sources": [self._build_source_entry(cam) for cam in cameras],
                 "amqp": self.config.amqp,
                 "cp": self.config.cp,
                 "telemetry": {"report_interval_seconds": 5},
@@ -127,7 +121,33 @@ class WorkerProcess:
             # Add camera configurations
             for cam in cameras:
                 if cam in self.config.cameras:
-                    worker_config_data["cameras"][cam] = self.config.cameras[cam].dict()
+                    cam_cfg = self.config.cameras[cam]
+                    try:
+                        # pydantic v2
+                        worker_config_data["cameras"][cam] = cam_cfg.model_dump()
+                    except Exception:
+                        try:
+                            # pydantic v1
+                            worker_config_data["cameras"][cam] = cam_cfg.dict()
+                        except Exception:
+                            # Fallback
+                            worker_config_data["cameras"][cam] = {
+                                "camera_uuid": cam,
+                                "zones": [],
+                                "motion_gating": {
+                                    "enabled": True,
+                                    "downscale": 0.5,
+                                    "dilation_px": 6,
+                                    "min_area_px": 1500,
+                                    "cooldown_frames": 2,
+                                    "noise_floor": 12,
+                                },
+                                "allow_labels": ["person", "car", "truck"],
+                                "deny_labels": [],
+                                "min_score": 0.30,
+                                "zone_test": "center",
+                                "iou_threshold": 0.10,
+                            }
                 else:
                     # Default camera configuration
                     worker_config_data["cameras"][cam] = {
@@ -159,6 +179,35 @@ class WorkerProcess:
         except Exception as e:
             logger.error(f"Failed to create worker config for {self.worker_id}: {e}")
             raise
+
+    def _build_source_entry(self, cam: str) -> dict:
+        """Build sources[] entry including rtsp_url, tenant_id, site_id if available."""
+        entry = {
+            "camera_uuid": cam,
+            "url": f"rtsp://admin:password@localhost:8554/{cam}",
+        }
+        try:
+            cam_cfg = self.config.cameras.get(cam) if isinstance(self.config.cameras, dict) else None
+            if cam_cfg is not None:
+                # Pull attributes regardless of pydantic version
+                url = getattr(cam_cfg, "rtsp_url", None) or (
+                    cam_cfg.get("rtsp_url") if isinstance(cam_cfg, dict) else None
+                )
+                tenant_id = getattr(cam_cfg, "tenant_id", None) or (
+                    cam_cfg.get("tenant_id") if isinstance(cam_cfg, dict) else None
+                )
+                site_id = getattr(cam_cfg, "site_id", None) or (
+                    cam_cfg.get("site_id") if isinstance(cam_cfg, dict) else None
+                )
+                if url:
+                    entry["url"] = url
+                if tenant_id:
+                    entry["tenant_id"] = tenant_id
+                if site_id:
+                    entry["site_id"] = site_id
+        except Exception:
+            pass
+        return entry
 
     async def _monitor_output(self):
         """Monitor worker process output."""
