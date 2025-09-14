@@ -3,7 +3,7 @@ Production worker implementing the full Phase 2 specifications.
 Wraps InferencePipeline with RabbitMQ, Prometheus, motion detection, and zones.
 """
 import os
-os.environ["OPENVINO_FORCE"]="1"                # <— force-reinsert OV even if the model removed it
+os.environ["OPENVINO_FORCE"]="0"                # <— force-reinsert OV even if the model removed it
 os.environ["OPENVINO_DEVICE_TYPE"]="GPU"
 os.environ["OPENVINO_PRECISION"]="FP16"
 # os.environ["OPENVINO_PRECISION"]="INT8"
@@ -11,7 +11,7 @@ os.environ["OPENVINO_NUM_STREAMS"]="8"
 os.environ["OPENVINO_CACHE_DIR"]="/tmp/ov_cache"
 os.environ["OV_PATCH_VERBOSE"]="1"
 os.environ["ENABLE_FRAME_DROP_ON_VIDEO_FILE_RATE_LIMITING"]="True"
-os.environ["ENABLE_WORKFLOWS_PROFILING"]="True"
+os.environ["ENABLE_WORKFLOWS_PROFILING"]="False"
 
 import somba_pipeline.ov_ep_patch as ov_ep_patch
 ov_ep_patch.enable_openvino_gpu()
@@ -37,7 +37,7 @@ from aiohttp import web
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 # Import InferencePipeline and related classes
-from inference.core.interfaces.stream.inference_pipeline import InferencePipeline
+from inference.core.interfaces.stream.inference_pipeline import InferencePipeline, SinkMode
 from inference.core.interfaces.camera.entities import (
     VideoFrame,
     StatusUpdate,
@@ -197,6 +197,10 @@ class ProductionWorker:
         # Event queues
         self.detection_queue = asyncio.Queue(maxsize=1000)
         self.status_queue = asyncio.Queue(maxsize=100)
+        # Frame batch queue and concurrency controls for async processing
+        self.frame_batch_queue: Optional[asyncio.Queue] = None
+        self._frame_concurrency: int = int(os.getenv("WORKER_FRAME_CONCURRENCY", "4"))
+        self._frame_semaphore: Optional[asyncio.Semaphore] = None
 
         # Setup signal handlers
         signal.signal(signal.SIGTERM, self._handle_shutdown)
@@ -736,15 +740,18 @@ class ProductionWorker:
                         frames_to_infer.append(vf)
                         map_infer_index.append(idx)
                     else:
-                        # Count skipped frames and publish a throttled debug frame snapshot
+                        # Count skipped frames and schedule a throttled debug frame snapshot
                         self.frames_skipped_motion_total.labels(**self._cam_labels(camera_uuid)).inc()
-                        self._publish_debug(
-                            cam=camera_uuid,
-                            frame_bgr=vf.image,
-                            predictions=None,
-                            skipped_by_motion=True,
-                            fps=self._calculate_fps(camera_uuid),
-                        )
+                        try:
+                            self._schedule_debug_render(
+                                cam=camera_uuid,
+                                frame_bgr=vf.image,
+                                predictions=None,
+                                skipped_by_motion=True,
+                                fps=self._calculate_fps(camera_uuid),
+                            )
+                        except Exception:
+                            pass
                     continue
 
                 # Fallback path: we do not gate here; let existing sink logic handle legacy motion detector
@@ -884,6 +891,82 @@ class ProductionWorker:
         # Publish the annotated frame via the debug manager
         self.debug_mgr.publish_sink(cam, annotated)
 
+    async def _render_overlay_async(
+        self,
+        cam: str,
+        frame_bgr: np.ndarray,
+        *,
+        predictions: Optional[Dict] = None,
+        skipped_by_motion: bool = False,
+        fps: Optional[float] = None,
+    ) -> np.ndarray:
+        """Render overlay in thread executor to avoid blocking event loop."""
+        # Prepare data needed for rendering
+        self._remember_native_res(cam, frame_bgr)
+        cam_cfg_obj = self.config.cameras.get(cam)
+        cam_cfg = cam_cfg_obj.dict() if cam_cfg_obj else {}
+        h, w = frame_bgr.shape[:2]
+        dets = self._build_debug_detections(predictions, w, h)
+        if not skipped_by_motion and dets:
+            self._last_detections[cam] = dets
+        dets_for_render = dets if (not skipped_by_motion or dets) else self._last_detections.get(cam, [])
+        loop = asyncio.get_running_loop()
+        annotated = await loop.run_in_executor(
+            None,
+            lambda: render_debug_overlay(
+                frame_bgr.copy(),
+                camera_cfg=cam_cfg,
+                detections=dets_for_render,
+                native_resolution=self._native_res.get(cam),
+                show_fps=fps,
+                timestamp=time.time(),
+                motion_debug=self._motion_debug.get(cam),
+                inference_state=self._last_infer_state.get(cam),
+            ),
+        )
+        return annotated
+
+    async def _publish_debug_async(
+        self, cam: str, frame_bgr: np.ndarray, *,
+        predictions: Optional[Dict] = None,
+        skipped_by_motion: bool = False,
+        fps: Optional[float] = None,
+    ) -> None:
+        if not self._should_publish_debug(cam):
+            return
+        try:
+            annotated = await self._render_overlay_async(
+                cam,
+                frame_bgr,
+                predictions=predictions,
+                skipped_by_motion=skipped_by_motion,
+                fps=fps,
+            )
+            self.debug_mgr.publish_sink(cam, annotated)
+        except Exception:
+            pass
+
+    def _schedule_debug_render(
+        self, cam: str, frame_bgr: np.ndarray, *,
+        predictions: Optional[Dict] = None,
+        skipped_by_motion: bool = False,
+        fps: Optional[float] = None,
+    ) -> None:
+        """Schedule debug rendering on the event loop without blocking sink thread."""
+        if not self.event_loop:
+            return
+        def _submit():
+            asyncio.create_task(
+                self._publish_debug_async(
+                    cam,
+                    frame_bgr,
+                    predictions=predictions,
+                    skipped_by_motion=skipped_by_motion,
+                    fps=fps,
+                )
+            )
+        self.event_loop.call_soon_threadsafe(_submit)
+
     def _remember_native_res(self, cam: str, frame_bgr: np.ndarray) -> None:
         if cam not in self._native_res and frame_bgr is not None:
             h, w = frame_bgr.shape[:2]
@@ -974,8 +1057,8 @@ class ProductionWorker:
                     self.frames_skipped_motion_total.labels(**self._cam_labels(camera_uuid)).inc()
                     self._last_infer_state[camera_uuid] = "SKIP"
 
-                    # Render and publish debug frame (throttled)
-                    self._publish_debug(
+                    # Render and publish debug frame (throttled) without blocking event loop
+                    await self._publish_debug_async(
                         cam=camera_uuid,
                         frame_bgr=video_frame.image,
                         predictions=None,
@@ -1057,7 +1140,7 @@ class ProductionWorker:
                     pass
                 return [str(v)]
 
-            
+
                 zone_hits = _as_zone_hits(raw_zone_hits)
                 contours = None
                 if mask is not None:
@@ -1175,7 +1258,7 @@ class ProductionWorker:
 
             # Debug visual stream (non-blocking, fire-and-forget)
             self._last_infer_state[camera_uuid] = "INFER"
-            self._publish_debug(
+            await self._publish_debug_async(
                 cam=camera_uuid,
                 frame_bgr=video_frame.image,
                 predictions=raw_detections,
@@ -1220,14 +1303,15 @@ class ProductionWorker:
         if isinstance(video_frames, list):
             # Multiple frames - process each one
             # The predictions dict contains results for all frames
-            for video_frame in video_frames:
+            for idx, video_frame in enumerate(video_frames):
+                if video_frame is None:
+                    continue
                 # Extract predictions for this specific frame/source
                 frame_predictions = None
                 if predictions and isinstance(predictions, list):
-                    # If predictions is also a list, match by index
-                    source_idx = video_frame.source_id
-                    if source_idx < len(predictions):
-                        frame_predictions = predictions[source_idx]
+                    # If predictions is also a list, match by aligned index
+                    if idx < len(predictions):
+                        frame_predictions = predictions[idx]
                 elif predictions:
                     # If predictions is a single dict, use it for all frames
                     frame_predictions = predictions
@@ -1365,6 +1449,15 @@ class ProductionWorker:
                     )
                     channel = await connection.channel()
                     await channel.set_qos(prefetch_count=10)
+                    # Ensure detections exchange exists (topic, durable)
+                    try:
+                        await channel.declare_exchange(
+                            self.config.amqp["ex_detect"],
+                            aio_pika.ExchangeType.TOPIC,
+                            durable=True,
+                        )
+                    except Exception:
+                        pass
 
                 # Get detection event from queue
                 try:
@@ -1410,6 +1503,15 @@ class ProductionWorker:
                         f"amqp://guest:guest@{self.config.amqp['host']}/"
                     )
                     channel = await connection.channel()
+                    # Ensure status exchange exists (topic, durable)
+                    try:
+                        await channel.declare_exchange(
+                            self.config.amqp["ex_status"],
+                            aio_pika.ExchangeType.TOPIC,
+                            durable=True,
+                        )
+                    except Exception:
+                        pass
 
                 # Get status event from queue
                 try:
@@ -1689,6 +1791,13 @@ class ProductionWorker:
             self._run_debug_server(),
         ]
 
+        # Init frame batch processing primitives and workers
+        self.frame_batch_queue = asyncio.Queue(maxsize=16)
+        self._frame_semaphore = asyncio.Semaphore(self._frame_concurrency)
+        frame_workers = int(os.getenv("WORKER_FRAME_WORKERS", "2"))
+        for _ in range(max(1, frame_workers)):
+            tasks.append(self._frame_worker())
+
         # Add config watcher if enabled
         if self.config_path:
             self.config_watcher_task = asyncio.create_task(self._watch_config_changes())
@@ -1698,6 +1807,80 @@ class ProductionWorker:
 
     async def _run_debug_server(self):
         pass
+
+    def _enqueue_batch_from_sink(self, predictions, video_frames) -> None:
+        """Enqueue batch processing from sink thread without blocking it."""
+        if not self.event_loop or not self.frame_batch_queue:
+            # Fallback to previous behaviour if loop not ready
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._on_prediction(predictions, video_frames), self.event_loop
+                )
+            except Exception:
+                pass
+            return
+        def _put():
+            try:
+                self.frame_batch_queue.put_nowait((predictions, video_frames))
+            except asyncio.QueueFull:
+                # Drop oldest by getting one and putting new to keep freshness
+                try:
+                    _ = self.frame_batch_queue.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    self.frame_batch_queue.put_nowait((predictions, video_frames))
+                except Exception:
+                    pass
+        self.event_loop.call_soon_threadsafe(_put)
+
+    async def _frame_worker(self):
+        """Consume batches and process frames with bounded concurrency."""
+        while self.running:
+            try:
+                item = await asyncio.wait_for(self.frame_batch_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                if item is None:
+                    continue
+                predictions, video_frames = item
+                await self._process_batch_item(predictions, video_frames)
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.frame_batch_queue.task_done()
+                except Exception:
+                    pass
+
+    async def _process_batch_item(self, predictions, video_frames) -> None:
+        # Normalize to lists and align by index; skip None frames
+        frames_list: List[VideoFrame] = (
+            list(video_frames)
+            if isinstance(video_frames, list)
+            else ([video_frames] if video_frames is not None else [])
+        )
+        # predictions could be list or single dict
+        if isinstance(predictions, list):
+            preds_list = predictions
+        else:
+            preds_list = [predictions] * len(frames_list)
+        tasks = []
+        for idx, vf in enumerate(frames_list):
+            if vf is None:
+                continue
+            pred = preds_list[idx] if idx < len(preds_list) else None
+            tasks.append(self._limited_process_frame(pred, vf))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _limited_process_frame(self, predictions, video_frame: VideoFrame) -> None:
+        if self._frame_semaphore is None:
+            await self._on_prediction_single_frame(predictions, video_frame)
+            return
+        async with self._frame_semaphore:
+            await self._on_prediction_single_frame(predictions, video_frame)
 
     def _get_camera_uuid(self, source_id: int) -> str:
         """Map source_id to camera_uuid."""
@@ -2040,13 +2223,21 @@ class ProductionWorker:
                     f"=== SYNC WRAPPER called with {len(video_frames)} frames ==="
                 )
                 for vf in video_frames:
-                    logger.debug(
-                        f"  Frame: source_id={vf.source_id}, frame_id={vf.frame_id}"
-                    )
+                    if vf is None:
+                        continue
+                    try:
+                        logger.debug(
+                            f"  Frame: source_id={vf.source_id}, frame_id={vf.frame_id}"
+                        )
+                    except Exception:
+                        pass
             else:
-                logger.debug(
-                    f"=== SYNC WRAPPER called with single frame: source_id={video_frames.source_id}, frame_id={video_frames.frame_id} ==="
-                )
+                try:
+                    logger.debug(
+                        f"=== SYNC WRAPPER called with single frame: source_id={video_frames.source_id}, frame_id={video_frames.frame_id} ==="
+                    )
+                except Exception:
+                    logger.debug("=== SYNC WRAPPER called with single frame ===")
 
             logger.debug(f"Predictions type: {type(predictions)}")
 
@@ -2055,19 +2246,8 @@ class ProductionWorker:
                 logger.error("Event loop not available for prediction callback!")
                 return
 
-            # Submit async work to event loop
-            try:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._on_prediction(predictions, video_frames), self.event_loop
-                )
-                logger.debug(
-                    f"Submitted async prediction to event loop, future: {future}"
-                )
-                # Don't wait for the future - let it run async
-            except Exception as e:
-                logger.error(
-                    f"Failed to submit prediction to event loop: {e}", exc_info=True
-                )
+            # Enqueue batch to async workers without blocking sink
+            self._enqueue_batch_from_sink(predictions, video_frames)
 
         logger.info("Creating InferencePipeline with workflow...")
         logger.info(f"Registering prediction callback: {sync_prediction_wrapper}")
@@ -2083,6 +2263,8 @@ class ProductionWorker:
             status_update_handlers=[self._on_status_update],
             max_fps=self.config.max_fps,
             workflows_thread_pool_workers=2,
+            sink_mode=SinkMode.BATCH,
+            batch_collection_timeout=float(os.getenv("BATCH_COLLECTION_TIMEOUT", "0.2")),
         )
 
         logger.info(f"InferencePipeline initialized with {len(video_urls)} sources")
