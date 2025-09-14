@@ -303,6 +303,41 @@ class ProductionWorker:
 
         logger.info("Prometheus metrics initialized")
 
+    def _patch_workflows_execution_engine_executor(self) -> None:
+        """Ensure Workflows Execution Engine reuses the thread pool created by InferencePipeline.
+
+        InferencePipeline.init_with_workflow creates a ThreadPoolExecutor and stores it under
+        `workflow_init_parameters["workflows_core.thread_pool_executor"]` but does not pass it to
+        ExecutionEngine.init(...) as `executor`. Without that, Execution Engine falls back to
+        creating ephemeral executors during dispatch, which may look like a new thread per inference.
+
+        We cannot modify the inference/ package here, so we monkey‑patch ExecutionEngine.init at runtime
+        to default `executor` from init_parameters if not explicitly provided.
+        """
+        try:
+            from inference.core.workflows.execution_engine.core import ExecutionEngine
+
+            # Guard against double‑patching
+            if getattr(ExecutionEngine, "_init_patched_for_executor", False):
+                return
+
+            original_init = ExecutionEngine.init
+
+            def _patched_init(cls, *args, **kwargs):  # type: ignore[no-redef]
+                # If no executor provided, try to reuse one from init_parameters
+                if kwargs.get("executor") is None:
+                    init_params = kwargs.get("init_parameters") or {}
+                    pool = init_params.get("workflows_core.thread_pool_executor")
+                    if pool is not None:
+                        kwargs["executor"] = pool
+                return original_init(cls, *args, **kwargs)
+
+            ExecutionEngine.init = classmethod(_patched_init)  # type: ignore[assignment]
+            setattr(ExecutionEngine, "_init_patched_for_executor", True)
+            logger.info("Patched ExecutionEngine.init to reuse workflow thread pool executor.")
+        except Exception as e:
+            logger.warning(f"Could not patch ExecutionEngine.init: {e}")
+
     def _update_motion_rate_metrics(self, camera_uuid: str) -> None:
         """Update motion rate and skip ratio gauges for a camera."""
         try:
@@ -2161,6 +2196,9 @@ class ProductionWorker:
             # Wait for event loop to be ready
             while not self.event_loop:
                 time.sleep(0.1)
+
+            # Ensure Workflows Execution Engine will reuse thread pool from InferencePipeline
+            self._patch_workflows_execution_engine_executor()
 
             # Initialize real InferencePipeline
             logger.info("Initializing InferencePipeline...")
