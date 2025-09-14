@@ -303,6 +303,31 @@ class ProductionWorker:
 
         logger.info("Prometheus metrics initialized")
 
+    def _throttled_gauge_set(
+        self,
+        gauge: Gauge,
+        labels: Dict[str, str],
+        value: float,
+        key: str,
+        min_interval_s: float = 0.5,
+    ) -> None:
+        now = time.time()
+        last = self._gauge_last_update.get(key, 0.0)
+        if (now - last) >= min_interval_s:
+            try:
+                gauge.labels(**labels).set(value)
+            finally:
+                self._gauge_last_update[key] = now
+
+    def _serialize_event(self, event: Any) -> bytes:
+        """Serialize pydantic model event to bytes with orjson if available."""
+        try:
+            if _orjson is not None:
+                return _orjson.dumps(event.model_dump(mode="json"))
+            return event.model_dump_json().encode()
+        except Exception:
+            return json.dumps(event.model_dump(mode="json")).encode()
+
     def _patch_workflows_execution_engine_executor(self) -> None:
         """Ensure Workflows Execution Engine reuses the thread pool created by InferencePipeline.
 
@@ -330,7 +355,8 @@ class ProductionWorker:
                     pool = init_params.get("workflows_core.thread_pool_executor")
                     if pool is not None:
                         kwargs["executor"] = pool
-                return original_init(cls, *args, **kwargs)
+                # original_init is already bound as a classmethod; do not pass cls again
+                return original_init(*args, **kwargs)
 
             ExecutionEngine.init = classmethod(_patched_init)  # type: ignore[assignment]
             setattr(ExecutionEngine, "_init_patched_for_executor", True)
@@ -2451,29 +2477,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    def _throttled_gauge_set(
-        self,
-        gauge: Gauge,
-        labels: Dict[str, str],
-        value: float,
-        key: str,
-        min_interval_s: float = 0.5,
-    ) -> None:
-        now = time.time()
-        last = self._gauge_last_update.get(key, 0.0)
-        if (now - last) >= min_interval_s:
-            try:
-                gauge.labels(**labels).set(value)
-            finally:
-                self._gauge_last_update[key] = now
-
-    def _serialize_event(self, event: Any) -> bytes:
-        """Serialize pydantic model event to bytes with orjson if available."""
-        try:
-            if _orjson is not None:
-                # model_dump keeps types JSON serializable; include numpy support
-                return _orjson.dumps(event.model_dump(mode="json"))
-            return event.model_dump_json().encode()
-        except Exception:
-            # Fallback to std json via dict
-            return json.dumps(event.model_dump(mode="json")).encode()
