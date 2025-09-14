@@ -2336,7 +2336,6 @@ class ProductionWorker:
             status_update_handlers=[self._on_status_update],
             max_fps=self.config.max_fps,
             workflows_thread_pool_workers=2,
-            sink_mode=SinkMode.BATCH,
             batch_collection_timeout=float(os.getenv("BATCH_COLLECTION_TIMEOUT", "0.2")),
         )
 
@@ -2348,6 +2347,13 @@ class ProductionWorker:
         logger.info(
             f"Pipeline has inference thread: {hasattr(pipeline, '_inference_thread')}"
         )
+
+        # Force batch sink mode for consistent multi-source handling in workflows variant
+        try:
+            pipeline._sink_mode = SinkMode.BATCH
+            logger.info("Set pipeline sink mode to BATCH for workflow pipeline.")
+        except Exception as e:
+            logger.warning(f"Could not set pipeline sink mode to BATCH: {e}")
 
         # Install motion-first gating wrapper over pipeline's on_video_frame.
         # This avoids wasted inference when no motion or during cooldown.
