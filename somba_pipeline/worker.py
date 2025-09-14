@@ -35,6 +35,10 @@ import cv2
 import numpy as np
 from aiohttp import web
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
+try:
+    import orjson as _orjson  # optional fast JSON
+except Exception:
+    _orjson = None
 
 # Import InferencePipeline and related classes
 from inference.core.interfaces.stream.inference_pipeline import InferencePipeline, SinkMode
@@ -188,6 +192,8 @@ class ProductionWorker:
         # FPS tracking (EMA per camera)
         self._fps_last_ts: Dict[str, float] = {}
         self._fps_ema: Dict[str, float] = {}
+        # Gauge throttling timestamps
+        self._gauge_last_update: Dict[str, float] = {}
 
         # When True, we have installed a motion-gating wrapper over the
         # pipeline's on_video_frame callable to avoid wasted inference.
@@ -308,12 +314,20 @@ class ProductionWorker:
             skip_ratio = float(stats.get("skip_rate", 0.0) or 0.0)
             tenant_id = self._get_tenant_id(camera_uuid)
             site_id = self._get_site_id(camera_uuid)
-            self.motion_rate_gauge.labels(
-                tenant_id=tenant_id, site_id=site_id, camera_uuid=camera_uuid
-            ).set(motion_rate)
-            self.motion_skip_ratio_gauge.labels(
-                tenant_id=tenant_id, site_id=site_id, camera_uuid=camera_uuid
-            ).set(skip_ratio)
+            self._throttled_gauge_set(
+                self.motion_rate_gauge,
+                dict(tenant_id=tenant_id, site_id=site_id, camera_uuid=camera_uuid),
+                motion_rate,
+                key=f"motion_rate:{camera_uuid}",
+                min_interval_s=0.5,
+            )
+            self._throttled_gauge_set(
+                self.motion_skip_ratio_gauge,
+                dict(tenant_id=tenant_id, site_id=site_id, camera_uuid=camera_uuid),
+                skip_ratio,
+                key=f"motion_skip:{camera_uuid}",
+                min_interval_s=0.5,
+            )
         except Exception:
             # Metrics should never break the pipeline
             pass
@@ -1439,6 +1453,8 @@ class ProductionWorker:
         """Continuously publish detection events to RabbitMQ."""
         connection = None
         channel = None
+        exchange = None
+        prefetch = int(os.getenv("AMQP_PREFETCH", "25"))
 
         while self.running:
             try:
@@ -1448,16 +1464,20 @@ class ProductionWorker:
                         f"amqp://guest:guest@{self.config.amqp['host']}/"
                     )
                     channel = await connection.channel()
-                    await channel.set_qos(prefetch_count=10)
+                    await channel.set_qos(prefetch_count=prefetch)
                     # Ensure detections exchange exists (topic, durable)
                     try:
-                        await channel.declare_exchange(
+                        exchange = await channel.declare_exchange(
                             self.config.amqp["ex_detect"],
                             aio_pika.ExchangeType.TOPIC,
                             durable=True,
                         )
                     except Exception:
-                        pass
+                        # Likely exists - fetch reference
+                        try:
+                            exchange = await channel.get_exchange(self.config.amqp["ex_detect"])
+                        except Exception:
+                            exchange = None
 
                 # Get detection event from queue
                 try:
@@ -1473,11 +1493,12 @@ class ProductionWorker:
                 )
 
                 message = aio_pika.Message(
-                    body=event.model_dump_json().encode(),
+                    body=self._serialize_event(event),
                     delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 )
 
-                exchange = await channel.get_exchange(self.config.amqp["ex_detect"])
+                if exchange is None:
+                    exchange = await channel.get_exchange(self.config.amqp["ex_detect"])
                 await exchange.publish(message, routing_key=routing_key)
 
                 logger.debug(f"Published detection for {event.camera_uuid}")
@@ -1494,6 +1515,8 @@ class ProductionWorker:
         """Continuously publish status events to RabbitMQ."""
         connection = None
         channel = None
+        exchange = None
+        prefetch = int(os.getenv("AMQP_PREFETCH", "25"))
 
         while self.running:
             try:
@@ -1503,15 +1526,19 @@ class ProductionWorker:
                         f"amqp://guest:guest@{self.config.amqp['host']}/"
                     )
                     channel = await connection.channel()
+                    await channel.set_qos(prefetch_count=prefetch)
                     # Ensure status exchange exists (topic, durable)
                     try:
-                        await channel.declare_exchange(
+                        exchange = await channel.declare_exchange(
                             self.config.amqp["ex_status"],
                             aio_pika.ExchangeType.TOPIC,
                             durable=True,
                         )
                     except Exception:
-                        pass
+                        try:
+                            exchange = await channel.get_exchange(self.config.amqp["ex_status"])
+                        except Exception:
+                            exchange = None
 
                 # Get status event from queue
                 try:
@@ -1533,11 +1560,12 @@ class ProductionWorker:
                     )
 
                 message = aio_pika.Message(
-                    body=event.model_dump_json().encode(),
+                    body=self._serialize_event(event),
                     delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 )
 
-                exchange = await channel.get_exchange(self.config.amqp["ex_status"])
+                if exchange is None:
+                    exchange = await channel.get_exchange(self.config.amqp["ex_status"])
                 await exchange.publish(message, routing_key=routing_key)
 
                 # Log differently based on event type
@@ -1923,10 +1951,17 @@ class ProductionWorker:
                 alpha = 0.2
                 ema = (1 - alpha) * prev + alpha * inst_fps
                 self._fps_ema[camera_uuid] = ema
-                # Update gauge
-            self.stream_fps.labels(**self._cam_labels(camera_uuid)).set(ema)
+            # Update gauge (throttled)
+            ema = float(self._fps_ema.get(camera_uuid, 0.0))
+            self._throttled_gauge_set(
+                self.stream_fps,
+                self._cam_labels(camera_uuid),
+                ema,
+                key=f"stream_fps:{camera_uuid}",
+                min_interval_s=0.5,
+            )
             self._fps_last_ts[camera_uuid] = t
-            return float(self._fps_ema.get(camera_uuid, 0.0))
+            return ema
         except Exception:
             return 0.0
 
@@ -2372,3 +2407,29 @@ def main():
 
 if __name__ == "__main__":
     main()
+    def _throttled_gauge_set(
+        self,
+        gauge: Gauge,
+        labels: Dict[str, str],
+        value: float,
+        key: str,
+        min_interval_s: float = 0.5,
+    ) -> None:
+        now = time.time()
+        last = self._gauge_last_update.get(key, 0.0)
+        if (now - last) >= min_interval_s:
+            try:
+                gauge.labels(**labels).set(value)
+            finally:
+                self._gauge_last_update[key] = now
+
+    def _serialize_event(self, event: Any) -> bytes:
+        """Serialize pydantic model event to bytes with orjson if available."""
+        try:
+            if _orjson is not None:
+                # model_dump keeps types JSON serializable; include numpy support
+                return _orjson.dumps(event.model_dump(mode="json"))
+            return event.model_dump_json().encode()
+        except Exception:
+            # Fallback to std json via dict
+            return json.dumps(event.model_dump(mode="json")).encode()
