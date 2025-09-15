@@ -21,7 +21,7 @@ __all__ = [
 
 @dataclass
 class MjpegOptions:
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 8089
     boundary: str = "frame"
     # Per-stream defaults (can be overridden by publisher)

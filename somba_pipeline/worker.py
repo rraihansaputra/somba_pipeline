@@ -1867,7 +1867,7 @@ class ProductionWorker:
             qs = request.rel_url.query
 
             # Host/port to receive the RTP stream (often localhost + go2rtc/ffplay port)
-            host = qs.get("host", "127.0.0.1")
+            host = qs.get("host", "0.0.0.0")
             port = int(qs.get("port", "5002"))
             ttl  = int(qs.get("ttl", "30"))
 

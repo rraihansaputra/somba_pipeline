@@ -161,7 +161,7 @@ class PublisherSpec:
     backend: str = "mjpeg_http"   # {"mjpeg_http", "mpegts", "rtp"}
 
     # MJPEG HTTP options (safe defaults)
-    http_host: str = "127.0.0.1"
+    http_host: str = "0.0.0.0"
     http_port: int = 8089
     http_fps: int = 10
     http_quality: int = 80
