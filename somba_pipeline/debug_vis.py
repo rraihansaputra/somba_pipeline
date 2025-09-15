@@ -506,10 +506,11 @@ class DebugManager:
 
     def close_all(self):
         with self._lock:
-            sinks = list(self._sinks.items())
-            self._sinks.clear()
-        for _, sink in sinks:
+            pubs = list(self._publishers.items())
+            self._publishers.clear()
+        for _, pub in pubs:
             try:
-                sink.close()
+                if isinstance(pub, MjpegHttpPublisher):
+                    pub.close()
             except Exception:
                 pass

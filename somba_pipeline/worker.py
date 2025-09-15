@@ -3,7 +3,7 @@ Production worker implementing the full Phase 2 specifications.
 Wraps InferencePipeline with RabbitMQ, Prometheus, motion detection, and zones.
 """
 import os
-os.environ["OPENVINO_FORCE"]="0"                # <— force-reinsert OV even if the model removed it
+os.environ["OPENVINO_FORCE"]="1"                # <— force-reinsert OV even if the model removed it
 os.environ["OPENVINO_DEVICE_TYPE"]="GPU"
 os.environ["OPENVINO_PRECISION"]="FP16"
 # os.environ["OPENVINO_PRECISION"]="INT8"
@@ -192,6 +192,13 @@ class ProductionWorker:
         # FPS tracking (EMA per camera)
         self._fps_last_ts: Dict[str, float] = {}
         self._fps_ema: Dict[str, float] = {}
+        # Inference FPS tracking and last inference time per camera
+        self._infer_fps_last_ts: Dict[str, float] = {}
+        self._infer_fps_ema: Dict[str, float] = {}
+        self._last_infer_ts: Dict[str, float] = {}
+        # Dropped frame accounting
+        self._drop_total: Dict[str, int] = {}
+        self._last_drop_ts: Dict[str, float] = {}
         # Gauge throttling timestamps
         self._gauge_last_update: Dict[str, float] = {}
 
@@ -812,6 +819,18 @@ class ProductionWorker:
                     )
 
                     if decision.should_infer:
+                        # Mark as pending inference and push a live debug frame using last detections
+                        self._last_infer_state[camera_uuid] = "PENDING"
+                        try:
+                            self._schedule_debug_render(
+                                cam=camera_uuid,
+                                frame_bgr=vf.image,
+                                predictions=None,
+                                skipped_by_motion=False,
+                                fps=self._calculate_fps(camera_uuid),
+                            )
+                        except Exception:
+                            pass
                         frames_to_infer.append(vf)
                         map_infer_index.append(idx)
                     else:
@@ -953,6 +972,17 @@ class ProductionWorker:
             dets_for_render = self._last_detections.get(cam, [])
 
         # Render overlay using the new Python renderer
+        # Compute inference HUD extras
+        now = time.time()
+        infer_fps_val = float(self._infer_fps_ema.get(cam) or 0.0)
+        last_infer_age = None
+        if cam in self._last_infer_ts:
+            last_infer_age = max(0.0, now - float(self._last_infer_ts[cam]))
+        drop_total = int(self._drop_total.get(cam, 0))
+        recent_drop_age = None
+        if cam in self._last_drop_ts:
+            recent_drop_age = max(0.0, now - float(self._last_drop_ts[cam]))
+
         annotated = render_debug_overlay(
             frame_bgr.copy(),
             camera_cfg=cam_cfg,
@@ -962,6 +992,10 @@ class ProductionWorker:
             timestamp=time.time(),
             motion_debug=self._motion_debug.get(cam),
             inference_state=self._last_infer_state.get(cam),
+            infer_fps=infer_fps_val,
+            last_infer_age_s=last_infer_age,
+            drop_total=drop_total,
+            recent_drop_age_s=recent_drop_age,
         )
         # Publish the annotated frame via the debug manager
         self.debug_mgr.publish_sink(cam, annotated)
@@ -986,6 +1020,17 @@ class ProductionWorker:
             self._last_detections[cam] = dets
         dets_for_render = dets if (not skipped_by_motion or dets) else self._last_detections.get(cam, [])
         loop = asyncio.get_running_loop()
+        # Compute inference HUD extras
+        now = time.time()
+        infer_fps_val = float(self._infer_fps_ema.get(cam) or 0.0)
+        last_infer_age = None
+        if cam in self._last_infer_ts:
+            last_infer_age = max(0.0, now - float(self._last_infer_ts[cam]))
+        drop_total = int(self._drop_total.get(cam, 0))
+        recent_drop_age = None
+        if cam in self._last_drop_ts:
+            recent_drop_age = max(0.0, now - float(self._last_drop_ts[cam]))
+
         annotated = await loop.run_in_executor(
             None,
             lambda: render_debug_overlay(
@@ -997,6 +1042,10 @@ class ProductionWorker:
                 timestamp=time.time(),
                 motion_debug=self._motion_debug.get(cam),
                 inference_state=self._last_infer_state.get(cam),
+                infer_fps=infer_fps_val,
+                last_infer_age_s=last_infer_age,
+                drop_total=drop_total,
+                recent_drop_age_s=recent_drop_age,
             ),
         )
         return annotated
@@ -1328,6 +1377,12 @@ class ProductionWorker:
                 objects=published_objects,
             )
 
+            # Mark inference completion for FPS/age
+            try:
+                self._mark_inference_complete(camera_uuid)
+            except Exception:
+                pass
+
             # Queue for publishing
             await self.detection_queue.put(detection_event)
 
@@ -1458,6 +1513,15 @@ class ProductionWorker:
             # Handle errors
             if update.severity == UpdateSeverity.ERROR:
                 self._handle_error_update(update, camera_uuid)
+
+            # Track dropped frames (for debug HUD)
+            try:
+                evt = (update.event_type or "").lower()
+                if "drop" in evt:  # e.g., frame_dropped
+                    self._drop_total[camera_uuid] = self._drop_total.get(camera_uuid, 0) + 1
+                    self._last_drop_ts[camera_uuid] = time.time()
+            except Exception:
+                pass
 
             # Create status event (edge-triggered) - but don't spam with frame events
             if state != old_state and not (
@@ -2025,6 +2089,29 @@ class ProductionWorker:
             return ema
         except Exception:
             return 0.0
+
+    def _tick_infer_fps(self, camera_uuid: str, now_ts: Optional[float] = None) -> float:
+        """Update per-camera inference FPS EMA; return current EMA."""
+        try:
+            t = now_ts if now_ts is not None else time.time()
+            last = self._infer_fps_last_ts.get(camera_uuid)
+            if last is not None:
+                dt = max(1e-6, t - last)
+                inst_fps = 1.0 / dt
+                prev = self._infer_fps_ema.get(camera_uuid, inst_fps)
+                alpha = 0.3
+                ema = (1 - alpha) * prev + alpha * inst_fps
+                self._infer_fps_ema[camera_uuid] = ema
+            self._infer_fps_last_ts[camera_uuid] = t
+            return float(self._infer_fps_ema.get(camera_uuid, 0.0))
+        except Exception:
+            return 0.0
+
+    def _mark_inference_complete(self, camera_uuid: str) -> None:
+        """Record inference completion time and update inference FPS EMA."""
+        now = time.time()
+        self._last_infer_ts[camera_uuid] = now
+        self._tick_infer_fps(camera_uuid, now_ts=now)
 
     def _calculate_e2e_latency(self, frame: VideoFrame) -> float:
         """Calculate end-to-end latency.

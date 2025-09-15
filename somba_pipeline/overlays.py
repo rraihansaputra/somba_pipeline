@@ -38,6 +38,24 @@ def _draw_label_box(img: np.ndarray, text: str, org: Tuple[int, int],
     cv2.putText(img, text, (x + pad, y - pad), font, fs, fg, thickness, cv2.LINE_AA)
 
 
+def _draw_hatched_polygon(img: np.ndarray, pts: np.ndarray, color: Tuple[int, int, int] = BGR_YELLOW, spacing: int = 12) -> None:
+    """Draw a hatched pattern inside the given polygon on img."""
+    h, w = img.shape[:2]
+    # Polygon mask
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [pts], 255)
+    # Hatch canvas
+    hatch = np.zeros_like(img)
+    # Draw diagonal lines across the image
+    for i in range(-h, w + h, spacing):
+        pt1 = (max(0, i), max(0, -i))
+        pt2 = (min(w - 1, i + h), min(h - 1, h))
+        cv2.line(hatch, pt1, pt2, color, 1, lineType=cv2.LINE_AA)
+    # Apply inside polygon only
+    mask3 = cv2.merge([mask, mask, mask])
+    np.copyto(img, hatch, where=mask3.astype(bool))
+
+
 def render_debug_overlay(
     frame_bgr: np.ndarray,
     *,
@@ -48,6 +66,11 @@ def render_debug_overlay(
     timestamp: Optional[float] = None,
     motion_debug: Optional[Dict] = None,
     inference_state: Optional[str] = None,
+    infer_fps: Optional[float] = None,
+    last_infer_age_s: Optional[float] = None,
+    drop_total: Optional[int] = None,
+    recent_drop_age_s: Optional[float] = None,
+    ghost_red: Optional[bool] = None,
 ) -> np.ndarray:
     """Draw zones and detections on a BGR frame and return the annotated image."""
     img = frame_bgr
@@ -56,26 +79,18 @@ def render_debug_overlay(
 
     zones = camera_cfg.get("zones") or []
 
-    # Draw zones with semi‑transparent fill
+    # Draw zones with yellow hatching and yellow outlines
     overlay = img.copy()
     for z in zones:
         poly = z.get("polygon") or []
         if not poly:
             continue
         pts = _scale_polygon(poly, cfg_w, cfg_h, w, h)
-        kind = (z.get("kind") or "include").lower()
-        is_excl = kind == "exclude"
-        color = BGR_RED if is_excl else BGR_GREEN
-        alpha = 0.18 if is_excl else 0.10
-        cv2.fillPoly(overlay, [pts], color=color)
-        cv2.polylines(img, [pts], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+        _draw_hatched_polygon(overlay, pts, color=BGR_YELLOW, spacing=12)
+        cv2.polylines(img, [pts], isClosed=True, color=BGR_YELLOW, thickness=2, lineType=cv2.LINE_AA)
 
         # Zone label
         label_parts = [f"#{z.get('zone_id', '?')} {z.get('name', '')}"]
-        if is_excl:
-            label_parts.append("exclude")
-        else:
-            label_parts.append("include")
         if z.get("allow_labels"):
             label_parts.append("allow:" + ",".join(z["allow_labels"]))
         if z.get("deny_labels"):
@@ -104,18 +119,15 @@ def render_debug_overlay(
         # Draw ALL motion contours (including below threshold)
         contours = motion_debug.get("contours", [])
         if contours:
-            # Different colors for significant vs below-threshold contours
-            significant_count = motion_debug.get("significant_contours", 0)
-            for idx, contour in enumerate(contours):
+            for contour in contours:
                 if len(contour) >= 3:
                     contour_array = np.array(contour, dtype=np.int32)
-                    # Yellow for significant, light gray for below threshold
-                    color = BGR_YELLOW if idx < significant_count else (150, 150, 150)
-                    thickness = 2 if idx < significant_count else 1
-                    cv2.polylines(img, [contour_array], isClosed=True, color=color, thickness=thickness, lineType=cv2.LINE_AA)
+                    cv2.polylines(img, [contour_array], isClosed=True, color=BGR_YELLOW, thickness=2, lineType=cv2.LINE_AA)
 
-    # Draw detections
+    # Draw detections (green for current inference; red when ghost on skipped frames)
     if detections:
+        use_red = bool(ghost_red)
+        det_color = BGR_RED if use_red else BGR_GREEN
         for det in detections:
             bbox = det.get("bbox") or det.get("xyxy")
             if not bbox or len(bbox) != 4:
@@ -124,13 +136,13 @@ def render_debug_overlay(
             label = det.get("label") or det.get("class") or "obj"
             score = float(det.get("score") or det.get("confidence") or 0.0)
             tid = det.get("track_id")
-            cv2.rectangle(img, (x1, y1), (x2, y2), BGR_YELLOW, 2)
+            cv2.rectangle(img, (x1, y1), (x2, y2), det_color, 2)
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            cv2.circle(img, (cx, cy), 3, BGR_WHITE, -1, lineType=cv2.LINE_AA)
+            cv2.circle(img, (cx, cy), 3, det_color, -1, lineType=cv2.LINE_AA)
             txt = f"{label} {score:.2f}"
             if tid is not None:
                 txt = f"id={tid} " + txt
-            _draw_label_box(img, txt, (x1, max(0, y1 - 6)))
+            _draw_label_box(img, txt, (x1, max(0, y1 - 6)), fg=BGR_BLACK, bg=det_color)
 
     # Motion debug chip (if provided)
     if motion_debug:
@@ -176,15 +188,26 @@ def render_debug_overlay(
 
     # Inference state chip (if provided)
     if inference_state:
-        # Move down to accommodate more motion debug info
-        _draw_label_box(img, inference_state, (10, 155))
+        # Compose inference state details with age if available
+        state_txt = inference_state
+        if last_infer_age_s is not None:
+            state_txt += f" | age {last_infer_age_s*1000:.0f} ms"
+        if infer_fps is not None and infer_fps > 0:
+            state_txt += f" | {infer_fps:.1f} iFPS"
+        _draw_label_box(img, state_txt, (10, 155))
 
-    # HUD with timestamp / FPS
+    # HUD with timestamp / FPS and drop info
     if timestamp is not None or show_fps is not None:
         ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp or time.time()))
         hud = ts_str
         if show_fps is not None and show_fps > 0:
             hud += f"  |  {show_fps:.1f} FPS"
+        if infer_fps is not None and infer_fps > 0:
+            hud += f"  |  {infer_fps:.1f} iFPS"
+        if drop_total is not None and drop_total >= 0:
+            hud += f"  |  drops: {drop_total}"
+        if recent_drop_age_s is not None and recent_drop_age_s >= 0.0:
+            hud += f"  |  last drop {recent_drop_age_s:.1f}s ago"
         _draw_label_box(img, hud, (10, h - 10))
 
     return img
